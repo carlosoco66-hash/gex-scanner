@@ -11,6 +11,16 @@ from gex_engine import (
     calculate_levels
 )
 
+# Funciones con caché para optimizar consultas de la API
+@st.cache_data(ttl=300)
+def cached_options_expirations(ticker, api_key):
+    return get_options_expirations(ticker, api_key)
+
+@st.cache_data(ttl=300)
+def cached_fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, mode):
+    return fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, mode=mode)
+
+
 # Configuración de página
 st.set_page_config(page_title="Gamma Scanner Options", page_icon="📊", layout="wide")
 
@@ -98,6 +108,13 @@ rango_pct = st.sidebar.slider(
     value=15,
     step=5
 )
+
+# Botón para forzar actualización (limpia la caché)
+if st.sidebar.button("🔄 Forzar Actualización", use_container_width=True):
+    st.cache_data.clear()
+    st.sidebar.success("Caché limpiada con éxito.")
+    st.rerun()
+
 
 # Helper para formatear millones
 def format_millions(val, mode="USD"):
@@ -366,7 +383,7 @@ if btn_fetch or ticker != st.session_state.last_ticker:
         st.error("Por favor, ingresa tu clave API de FlashAlpha en el menú lateral.")
     else:
         with st.spinner("Cargando fechas de expiración..."):
-            exps = get_options_expirations(ticker, api_key)
+            exps = cached_options_expirations(ticker, api_key)
             if exps:
                 st.session_state.expirations = exps
                 st.session_state.last_ticker = ticker
@@ -391,7 +408,7 @@ if st.session_state.expirations:
     if btn_calc or 'gex_results' in st.session_state:
         if btn_calc or ticker != st.session_state.get('results_ticker') or engine_mode != st.session_state.get('results_mode'):
             with st.spinner("Descargando libro de opciones y calculando GEX..."):
-                df_gex, df_dex, df_raw, spot = fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, mode=engine_mode)
+                df_gex, df_dex, df_raw, spot = cached_fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, mode=engine_mode)
                 
                 if df_gex.empty:
                     st.error("No hay suficientes datos de opciones disponibles para calcular los niveles.")
