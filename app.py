@@ -201,14 +201,16 @@ def plot_gex_plotly(df_gex, spot, mode="USD", pct=15):
             x=max_pos['strike'], y=max_pos['call_gex'],
             text=f"▲ Strike {max_pos['strike']:.1f} ({format_millions(max_pos['call_gex'], mode)})",
             showarrow=True, arrowhead=1, arrowcolor="white",
-            ax=0, ay=-45, bgcolor="black", font=dict(color="white", size=9)
+            ax=0, ay=-45, bgcolor="black", font=dict(color="white", size=9),
+            standoff=8
         )
         
         fig.add_annotation(
             x=min_neg['strike'], y=min_neg['put_gex'],
             text=f"▼ Strike {min_neg['strike']:.1f} ({format_millions(min_neg['put_gex'], mode)})",
             showarrow=True, arrowhead=1, arrowcolor="#348feb",
-            ax=0, ay=45, bgcolor="black", font=dict(color="#348feb", size=9)
+            ax=0, ay=45, bgcolor="black", font=dict(color="#348feb", size=9),
+            standoff=8
         )
     
     y_label = "Exposición (USD)" if mode == "USD" else "Exposición (Acciones)"
@@ -273,14 +275,16 @@ def plot_dex_plotly(df_dex, spot, mode="USD", pct=15):
             x=max_pos['strike'], y=max_pos['call_dex'],
             text=f"▲ Strike {max_pos['strike']:.1f} ({format_millions(max_pos['call_dex'], mode)})",
             showarrow=True, arrowhead=1, arrowcolor="white",
-            ax=0, ay=-45, bgcolor="black", font=dict(color="white", size=9)
+            ax=0, ay=-45, bgcolor="black", font=dict(color="white", size=9),
+            standoff=8
         )
         
         fig.add_annotation(
             x=min_neg['strike'], y=-abs(min_neg['put_dex']),
             text=f"▼ Strike {min_neg['strike']:.1f} ({format_millions(min_neg['put_dex'], mode)})",
             showarrow=True, arrowhead=1, arrowcolor="#348feb",
-            ax=0, ay=45, bgcolor="black", font=dict(color="#348feb", size=9)
+            ax=0, ay=45, bgcolor="black", font=dict(color="#348feb", size=9),
+            standoff=8
         )
     
     y_label = "Exposición (USD)" if mode == "USD" else "Exposición (Acciones)"
@@ -337,7 +341,8 @@ def plot_oi_gex_plotly(df_gex, spot, pct=15):
                 x=s, y=g,
                 text=f"{s:.0f}<br>OI {oi:,}",
                 showarrow=True, arrowhead=1, arrowcolor="gray",
-                ax=0, ay=ay_val, bgcolor="black", font=dict(color="white", size=9)
+                ax=0, ay=ay_val, bgcolor="black", font=dict(color="white", size=9),
+                standoff=8
             )
         
     fig.update_layout(
