@@ -97,6 +97,79 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
     except Exception as e:
         print(f"Error fetching option_quote: {e}")
         
+    # Fallback a yfinance si FlashAlpha no devolvió datos para el símbolo
+    if df_raw.empty:
+        try:
+            print(f"[FALLBACK] Iniciando descarga de opciones por yfinance para {ticker}...")
+            t = yf.Ticker(ticker)
+            expirations_to_fetch = selected_expirations if selected_expirations else t.options
+            
+            all_options = []
+            for exp in expirations_to_fetch:
+                try:
+                    opt = t.option_chain(exp)
+                    calls = opt.calls.copy()
+                    calls['type'] = 'C'
+                    calls['expiry'] = exp
+                    puts = opt.puts.copy()
+                    puts['type'] = 'P'
+                    puts['expiry'] = exp
+                    all_options.append(calls)
+                    all_options.append(puts)
+                except Exception as e_exp:
+                    print(f"Error fetching yfinance option chain for {exp}: {e_exp}")
+                    
+            if all_options:
+                df_yf_raw = pd.concat(all_options, ignore_index=True)
+                df_raw = pd.DataFrame()
+                df_raw['strike'] = df_yf_raw['strike']
+                df_raw['type'] = df_yf_raw['type']
+                df_raw['expiry'] = df_yf_raw['expiry']
+                df_raw['open_interest'] = df_yf_raw['openInterest'].fillna(0.0).astype(float)
+                df_raw['volume'] = df_yf_raw['volume'].fillna(0.0).astype(float)
+                df_raw['implied_volatility'] = df_yf_raw['impliedVolatility'].fillna(0.0).astype(float)
+                
+                today = datetime.date.today()
+                df_raw['dte'] = df_raw['expiry'].apply(
+                    lambda e: (datetime.datetime.strptime(e, "%Y-%m-%d").date() - today).days
+                )
+                
+                # Calcular Delta y Gamma con Black-Scholes
+                import math
+                gammas = []
+                deltas = []
+                for idx, row in df_raw.iterrows():
+                    k_strike = row['strike']
+                    k_dte = row['dte']
+                    k_iv = row['implied_volatility']
+                    k_type = row['type']
+                    
+                    if k_dte <= 0 or k_iv <= 0 or spot <= 0 or k_strike <= 0:
+                        gammas.append(0.0)
+                        deltas.append(0.0)
+                        continue
+                        
+                    T = k_dte / 365.0
+                    r = 0.045
+                    try:
+                        d1 = (math.log(spot / k_strike) + (r + 0.5 * k_iv ** 2) * T) / (k_iv * math.sqrt(T))
+                        pdf = math.exp(-0.5 * d1**2) / math.sqrt(2.0 * math.pi)
+                        gamma = pdf / (spot * k_iv * math.sqrt(T))
+                        
+                        cdf = 0.5 * (1.0 + math.erf(d1 / math.sqrt(2.0)))
+                        delta = cdf if k_type == 'C' else (cdf - 1.0)
+                        
+                        gammas.append(gamma)
+                        deltas.append(delta)
+                    except Exception:
+                        gammas.append(0.0)
+                        deltas.append(0.0)
+                        
+                df_raw['gamma'] = gammas
+                df_raw['delta'] = deltas
+        except Exception as e_yf:
+            print(f"Error in yfinance options fallback for {ticker}: {e_yf}")
+        
     if df_raw.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), spot
         
