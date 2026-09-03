@@ -4,18 +4,63 @@ import numpy as np
 import yfinance as yf
 import datetime
 
+import requests
+
 def get_live_spot_price(ticker):
-    """Obtiene el precio spot en tiempo real usando yfinance."""
+    """
+    Obtiene el precio spot en tiempo real con múltiples capas de respaldo (fallbacks)
+    para evitar fallos por bloqueos de Yahoo Finance o rate-limiting en la nube.
+    """
+    ticker = ticker.upper().strip()
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9'
+    }
+
+    # 1. Yahoo Finance v8 chart API (Respuesta muy rápida y sin bloqueo de IP)
     try:
-        t = yf.Ticker(ticker.upper())
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d"
+        r = requests.get(url, headers=headers, timeout=4)
+        if r.status_code == 200:
+            data = r.json()
+            meta = data.get('chart', {}).get('result', [{}])[0].get('meta', {})
+            price = meta.get('regularMarketPrice')
+            if price and float(price) > 0:
+                return float(price)
+    except Exception as e:
+        print(f"Error en Yahoo v8 chart spot para {ticker}: {e}")
+
+    # 2. Yahoo Finance v7 quote API
+    try:
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
+        r = requests.get(url, headers=headers, timeout=4)
+        if r.status_code == 200:
+            data = r.json()
+            res = data.get('quoteResponse', {}).get('result', [])
+            if res:
+                price = res[0].get('regularMarketPrice') or res[0].get('postMarketPrice')
+                if price and float(price) > 0:
+                    return float(price)
+    except Exception as e:
+        print(f"Error en Yahoo v7 quote spot para {ticker}: {e}")
+
+    # 3. Fallback a yfinance clásico
+    try:
+        t = yf.Ticker(ticker)
         try:
-            return float(t.fast_info['lastPrice'])
-        except:
+            val = float(t.fast_info['lastPrice'])
+            if val > 0:
+                return val
+        except Exception:
             hist = t.history(period='1d')
             if not hist.empty:
-                return float(hist['Close'].iloc[-1])
+                val = float(hist['Close'].iloc[-1])
+                if val > 0:
+                    return val
     except Exception as e:
-        print(f"Error fetching yfinance spot for {ticker}: {e}")
+        print(f"Error fetching yfinance spot para {ticker}: {e}")
+
     return 0.0
 
 def get_options_expirations(ticker, api_key):

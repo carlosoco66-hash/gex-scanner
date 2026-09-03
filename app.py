@@ -14,11 +14,18 @@ from gex_engine import (
 # Funciones con caché para optimizar consultas de la API
 @st.cache_data(ttl=300)
 def cached_options_expirations(ticker, api_key):
-    return get_options_expirations(ticker, api_key)
+    res = get_options_expirations(ticker, api_key)
+    if not res:
+        st.cache_data.clear()
+    return res
 
 @st.cache_data(ttl=300)
 def cached_fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, mode):
-    return fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, mode=mode)
+    res = fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, mode=mode)
+    df_gex, df_dex, df_raw, spot = res
+    if spot == 0 or df_gex.empty:
+        st.cache_data.clear()
+    return res
 
 
 # Configuración de página
