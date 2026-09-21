@@ -116,29 +116,48 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
                 lambda e: (datetime.datetime.strptime(e, "%Y-%m-%d").date() - today).days
             )
             
-            # Limpiar tipos
-            df_raw['gamma'] = pd.to_numeric(df_raw['gamma'], errors='coerce')
-            df_raw['delta'] = pd.to_numeric(df_raw['delta'], errors='coerce')
+            # Limpiar tipos y obtener IV
             df_raw['strike'] = pd.to_numeric(df_raw['strike'], errors='coerce')
+            df_raw['open_interest'] = pd.to_numeric(df_raw['open_interest'], errors='coerce').fillna(0.0)
+            df_raw['volume'] = pd.to_numeric(df_raw['volume'], errors='coerce').fillna(0.0)
             
-            # Completar Gamma y Delta de Puts usando paridad Call-Put para corregir vacíos de la API
-            df_calls = df_raw[df_raw['type'] == 'C'][['strike', 'expiry', 'gamma', 'delta']].rename(
-                columns={'gamma': 'call_gamma', 'delta': 'call_delta'}
-            )
-            df_raw = df_raw.merge(df_calls, on=['strike', 'expiry'], how='left')
-            
-            df_raw['gamma'] = df_raw.apply(
-                lambda r: r['call_gamma'] if pd.notna(r['call_gamma']) else r['gamma'], 
-                axis=1
-            ).fillna(0.0).astype(float)
-            
-            df_raw['delta'] = df_raw.apply(
-                lambda r: (r['call_delta'] - 1.0) if r['type'] == 'P' and pd.notna(r['call_delta']) else r['delta'],
-                axis=1
-            ).fillna(0.0).astype(float)
-            
-            df_raw['open_interest'] = df_raw['open_interest'].fillna(0.0).astype(float)
-            df_raw['volume'] = df_raw['volume'].fillna(0.0).astype(float)
+            iv_col = 'implied_vol' if 'implied_vol' in df_raw.columns else ('implied_volatility' if 'implied_volatility' in df_raw.columns else 'iv')
+            if iv_col in df_raw.columns:
+                df_raw['iv'] = pd.to_numeric(df_raw[iv_col], errors='coerce').fillna(0.20)
+            else:
+                df_raw['iv'] = 0.20
+                
+            # Calcular Gamma y Delta con Black-Scholes para asegurar precisión total en 1 o múltiples expiraciones
+            import math
+            gammas = []
+            deltas = []
+            r = 0.045
+            for idx, row in df_raw.iterrows():
+                k_strike = row['strike']
+                k_dte = max(row['dte'], 0.5)
+                k_iv = row['iv'] if row['iv'] > 0 else 0.20
+                k_type = str(row['type']).upper()
+                
+                if spot <= 0 or k_strike <= 0:
+                    gammas.append(0.0)
+                    deltas.append(0.0)
+                    continue
+                    
+                T = k_dte / 365.0
+                try:
+                    d1 = (math.log(spot / k_strike) + (r + 0.5 * k_iv ** 2) * T) / (k_iv * math.sqrt(T))
+                    pdf = math.exp(-0.5 * d1**2) / math.sqrt(2.0 * math.pi)
+                    gamma = pdf / (spot * k_iv * math.sqrt(T))
+                    cdf = 0.5 * (1.0 + math.erf(d1 / math.sqrt(2.0)))
+                    delta = cdf if k_type in ['C', 'CALL'] else (cdf - 1.0)
+                    gammas.append(gamma)
+                    deltas.append(delta)
+                except Exception:
+                    gammas.append(0.0)
+                    deltas.append(0.0)
+                    
+            df_raw['gamma'] = gammas
+            df_raw['delta'] = deltas
     except Exception as e:
         print(f"Error fetching option_quote: {e}")
         
@@ -220,13 +239,13 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
         
     # Calcular exposiciones locales según el modo
     if mode == "Acciones":
-        # MODO ACCIONES: Exposición en acciones (sin el 100x y multiplicado por spot lineal)
-        df_raw['call_gex'] = df_raw.apply(lambda r: r['open_interest'] * r['gamma'] * spot if r['type'] == 'C' else 0.0, axis=1)
-        df_raw['put_gex'] = df_raw.apply(lambda r: -r['open_interest'] * r['gamma'] * spot if r['type'] == 'P' else 0.0, axis=1)
+        # MODO ACCIONES: Exposición en acciones (100 acciones por contrato)
+        df_raw['call_gex'] = df_raw.apply(lambda r: r['open_interest'] * 100.0 * r['gamma'] * spot if r['type'] == 'C' else 0.0, axis=1)
+        df_raw['put_gex'] = df_raw.apply(lambda r: -r['open_interest'] * 100.0 * r['gamma'] * spot if r['type'] == 'P' else 0.0, axis=1)
         df_raw['net_gex'] = df_raw['call_gex'] + df_raw['put_gex']
         
-        df_raw['call_dex'] = df_raw.apply(lambda r: r['open_interest'] * r['delta'] * spot if r['type'] == 'C' else 0.0, axis=1)
-        df_raw['put_dex'] = df_raw.apply(lambda r: r['open_interest'] * r['delta'] * spot if r['type'] == 'P' else 0.0, axis=1)
+        df_raw['call_dex'] = df_raw.apply(lambda r: r['open_interest'] * 100.0 * r['delta'] if r['type'] == 'C' else 0.0, axis=1)
+        df_raw['put_dex'] = df_raw.apply(lambda r: r['open_interest'] * 100.0 * r['delta'] if r['type'] == 'P' else 0.0, axis=1)
         df_raw['net_dex'] = df_raw['call_dex'] + df_raw['put_dex']
     else:
         # MODO USD: Fórmula oficial en USD (con spot*spot para GEX y delta*spot*100 para DEX)
