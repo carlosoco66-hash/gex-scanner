@@ -9,7 +9,8 @@ from gex_engine import (
     get_options_expirations,
     fetch_and_calculate_all,
     calculate_levels,
-    fetch_live_flow
+    fetch_live_flow,
+    calculate_tactical_metrics
 )
 
 # Funciones con caché para optimizar consultas de la API
@@ -725,6 +726,216 @@ if st.session_state.expirations:
                         for int_c in ["call_volume", "put_volume", "call_oi", "put_oi"]:
                             top_flow_df[int_c] = top_flow_df[int_c].astype(int)
                         st.dataframe(top_flow_df, use_container_width=True, hide_index=True)
+
+            # Fila 4.85: Panel 3 · PANEL TÁCTICO INTRADÍA (VEX, CHEX, Pin Risk & Expected Move)
+            st.markdown("<h2 class='custom-header'>3 · PANEL TÁCTICO INTRADÍA (VEX, CHEX, Pin Risk & Expected Move)</h2>", unsafe_allow_html=True)
+            tac = calculate_tactical_metrics(df_gex, df_raw, res["Spot Price"], live_flow=live_flow)
+
+            net_vex_val = tac["net_vex"]
+            net_chex_val = tac["net_chex"]
+            pin_st = tac["pin_strike"]
+            pin_sc = tac["pin_score"]
+            pin_lbl = tac["pin_label"]
+            c_wall = tac["call_wall"]
+            p_wall = tac["put_wall"]
+            em_1d = tac["em_1d"]
+            em_1d_pct = tac["em_1d_pct"]
+            em_low = tac["em_low_1d"]
+            em_high = tac["em_high_1d"]
+            atm_iv_pct = tac["atm_iv"] * 100.0
+
+            vex_color = "#2ecc71" if net_vex_val >= 0 else "#ff4d4d"
+            vex_sub = "Si IV baja → Dealers compran (Alcista)" if net_vex_val >= 0 else "Si IV sube → Acelera ventas (Bajista)"
+            chex_color = "#2ecc71" if net_chex_val >= 0 else "#ff4d4d"
+            chex_sub = "Paso del tiempo → Empuje alcista" if net_chex_val >= 0 else "Paso del tiempo → Presión bajista"
+            pin_color = "#ffcc00" if pin_sc >= 65 else ("#2ecc71" if pin_sc >= 40 else "#8b949e")
+
+            t_col1, t_col2, t_col3, t_col4 = st.columns(4)
+            with t_col1:
+                st.markdown(
+                    f'<div style="background:#161b22;border:1px solid #30363d;border-left:4px solid {vex_color};border-radius:8px;padding:12px 16px;">'
+                    f'<p style="color:#8b949e;margin:0;font-size:12px;">VEX Neto (Vanna Exposure)</p>'
+                    f'<p style="color:{vex_color};margin:4px 0 2px 0;font-size:22px;font-weight:800;">{format_millions(net_vex_val, engine_mode)}</p>'
+                    f'<p style="color:#c9d1d9;margin:0;font-size:11px;">{vex_sub}</p>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            with t_col2:
+                st.markdown(
+                    f'<div style="background:#161b22;border:1px solid #30363d;border-left:4px solid {chex_color};border-radius:8px;padding:12px 16px;">'
+                    f'<p style="color:#8b949e;margin:0;font-size:12px;">CHEX Neto (Charm / Día)</p>'
+                    f'<p style="color:{chex_color};margin:4px 0 2px 0;font-size:22px;font-weight:800;">{format_millions(net_chex_val, engine_mode)}</p>'
+                    f'<p style="color:#c9d1d9;margin:0;font-size:11px;">{chex_sub}</p>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            with t_col3:
+                st.markdown(
+                    f'<div style="background:#161b22;border:1px solid #30363d;border-left:4px solid {pin_color};border-radius:8px;padding:12px 16px;">'
+                    f'<p style="color:#8b949e;margin:0;font-size:12px;">Flow Levels & Pin Risk</p>'
+                    f'<p style="color:#ffffff;margin:4px 0 2px 0;font-size:22px;font-weight:800;">Pin ${pin_st:g} <span style="font-size:13px;color:{pin_color};">({pin_sc:.0f}/100 {pin_lbl})</span></p>'
+                    f'<p style="color:#c9d1d9;margin:0;font-size:11px;">Piso (Put): <b>${p_wall:g}</b> | Techo (Call): <b>${c_wall:g}</b></p>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            with t_col4:
+                st.markdown(
+                    f'<div style="background:#161b22;border:1px solid #30363d;border-left:4px solid #348feb;border-radius:8px;padding:12px 16px;">'
+                    f'<p style="color:#8b949e;margin:0;font-size:12px;">Expected Move Hoy (IV {atm_iv_pct:.1f}%)</p>'
+                    f'<p style="color:#ffffff;margin:4px 0 2px 0;font-size:22px;font-weight:800;">±${em_1d:.2f} <span style="font-size:13px;color:#348feb;">(±{em_1d_pct:.1f}%)</span></p>'
+                    f'<p style="color:#c9d1d9;margin:0;font-size:11px;">Rango: <b>${em_low:.2f}</b> ◄──► <b>${em_high:.2f}</b></p>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+            # Barra de Veredicto Operativo Automático
+            spot_now = res["Spot Price"]
+            tot_gex_now = res["Total Net GEX"]
+            f_dir_now = str(lf_summary.get("flow_direction", "no_flow")).lower()
+
+            bull_pts = 0
+            bear_pts = 0
+            if tot_gex_now >= 0:
+                bull_pts += 1
+            else:
+                bear_pts += 1
+            if net_vex_val >= 0:
+                bull_pts += 1
+            else:
+                bear_pts += 1
+            if f_dir_now == "bullish":
+                bull_pts += 2
+            elif f_dir_now == "bearish":
+                bear_pts += 2
+            if tac["total_call_prem_vol"] > tac["total_put_prem_vol"] * 1.15:
+                bull_pts += 1
+            elif tac["total_put_prem_vol"] > tac["total_call_prem_vol"] * 1.15:
+                bear_pts += 1
+
+            if bull_pts > bear_pts:
+                v_badge = "🟢 SESGO TÁCTICO: ALCISTA / BUSCAR LONG EN SOPORTE"
+                v_border = "#2ecc71"
+            elif bear_pts > bull_pts:
+                v_badge = "🔴 SESGO TÁCTICO: PRECAUCIÓN BAJISTA / RIESGO DE ACELERACIÓN"
+                v_border = "#ff4d4d"
+            else:
+                v_badge = "🟡 SESGO TÁCTICO: NEUTRAL / OPERAR RANGO Y PIN"
+                v_border = "#ffcc00"
+
+            gex_regime_txt = (
+                "GAMMA NEGATIVA (Volatilidad alta / Movimientos acelerados)"
+                if tot_gex_now < 0
+                else "GAMMA POSITIVA (Mercado amortiguado / Reversión a la media)"
+            )
+
+            verdict_html = (
+                f'<div style="background:#0b0e14;border:1.5px solid {v_border};border-radius:10px;padding:14px 18px;margin-top:14px;margin-bottom:16px;">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:6px;">'
+                f'<span style="color:{v_border};font-weight:800;font-size:15px;letter-spacing:0.4px;">{v_badge}</span>'
+                f'<span style="color:#8b949e;font-size:12px;font-family:monospace;">Régimen: {gex_regime_txt}</span>'
+                f'</div>'
+                f'<div style="color:#d0d7de;font-size:13.5px;line-height:1.55;">'
+                f'• <b>Plan Long:</b> Buscar compras si sostiene soporte/Put Wall en <b>${p_wall:g}</b> (con IV estable o bajando), apuntando al Imán/Pin <b>${pin_st:g}</b> y Call Wall <b>${c_wall:g}</b>. Evitar perseguir arriba del límite diario (<b>${em_high:.2f}</b>).<br>'
+                f'• <b>Plan Short:</b> Si pierde <b>${p_wall:g}</b> con aumento de IV y flujo vendedor, hay riesgo de aceleración rápida hacia el piso del rango esperado (<b>${em_low:.2f}</b>).'
+                f'</div>'
+                f'</div>'
+            )
+            st.markdown(verdict_html, unsafe_allow_html=True)
+
+            # 4 Pestañas Interactivas Compactas
+            tab_vex, tab_chex, tab_pin, tab_radar = st.tabs([
+                "📊 VEX (Vanna) por Strike",
+                "⏳ CHEX (Charm) por Strike",
+                "🎯 Flow Levels & Pin Risk",
+                "🌊 Trade Flow & Ratio Vol/OI",
+            ])
+
+            with tab_vex:
+                df_vp = df_gex[(df_gex["strike"] >= spot_now * (1 - rango_pct / 100.0)) & (df_gex["strike"] <= spot_now * (1 + rango_pct / 100.0))].copy()
+                fig_vex = go.Figure()
+                fig_vex.add_trace(go.Bar(x=df_vp["strike"], y=df_vp["call_vex"], name="VEX Calls (Arriba)", marker_color="#2ecc71", opacity=0.85))
+                fig_vex.add_trace(go.Bar(x=df_vp["strike"], y=df_vp["put_vex"], name="VEX Puts (Abajo)", marker_color="#348feb", opacity=0.85))
+                fig_vex.add_trace(go.Scatter(x=df_vp["strike"], y=df_vp["net_vex"], mode="lines+markers", line=dict(color="#ffcc00", width=2), name="VEX Neto"))
+                fig_vex.add_vline(x=spot_now, line_dash="dash", line_color="#ffcc00", line_width=2, annotation_text=f"Spot: ${spot_now:.2f}", annotation_position="top right")
+                fig_vex.update_layout(
+                    title=f"Vanna Exposure (VEX) por Strike — Impacto por cada 1% de cambio en IV ({engine_mode})",
+                    xaxis_title="Precio Strike",
+                    yaxis_title=f"Exposición Vanna ({engine_mode})",
+                    template="plotly_dark",
+                    plot_bgcolor="#0d0e15",
+                    paper_bgcolor="#0d0e15",
+                    barmode="relative",
+                    margin=dict(l=30, r=30, t=50, b=30),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig_vex, use_container_width=True)
+                st.caption("💡 **Cómo leer VEX:** En strikes con VEX positivo (verde), una caída de la Volatilidad Implícita (IV) obliga a los dealers a **comprar subyacente** (combustible alcista). En strikes con VEX negativo (azul), una subida de IV acelera las ventas.")
+
+            with tab_chex:
+                df_cp = df_gex[(df_gex["strike"] >= spot_now * (1 - rango_pct / 100.0)) & (df_gex["strike"] <= spot_now * (1 + rango_pct / 100.0))].copy()
+                fig_chex = go.Figure()
+                fig_chex.add_trace(go.Bar(x=df_cp["strike"], y=df_cp["call_chex"], name="CHEX Calls (Arriba)", marker_color="#a371f7", opacity=0.85))
+                fig_chex.add_trace(go.Bar(x=df_cp["strike"], y=df_cp["put_chex"], name="CHEX Puts (Abajo)", marker_color="#348feb", opacity=0.85))
+                fig_chex.add_trace(go.Scatter(x=df_cp["strike"], y=df_cp["net_chex"], mode="lines+markers", line=dict(color="#ff003c", width=2), name="CHEX Neto"))
+                fig_chex.add_vline(x=spot_now, line_dash="dash", line_color="#ffcc00", line_width=2, annotation_text=f"Spot: ${spot_now:.2f}", annotation_position="top right")
+                fig_chex.update_layout(
+                    title=f"Charm Exposure (CHEX) por Strike — Flujo diario por paso del tiempo ({engine_mode})",
+                    xaxis_title="Precio Strike",
+                    yaxis_title=f"Exposición Charm / Día ({engine_mode})",
+                    template="plotly_dark",
+                    plot_bgcolor="#0d0e15",
+                    paper_bgcolor="#0d0e15",
+                    barmode="relative",
+                    margin=dict(l=30, r=30, t=50, b=30),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig_chex, use_container_width=True)
+                st.caption("💡 **Cómo leer CHEX:** Muestra cuánto delta se deshace cada día solo por el paso del tiempo (efecto muy fuerte después del mediodía y en contratos de 0 a 8 DTE).")
+
+            with tab_pin:
+                col_p1, col_p2, col_p3 = st.columns(3)
+                col_p1.metric("🎯 Strike Imán (Top Pin)", f"${pin_st:g}", f"Score: {pin_sc:.1f}/100 ({pin_lbl})")
+                col_p2.metric("🧱 Call Wall (Techo Activo)", f"${c_wall:g}", f"{((c_wall - spot_now)/spot_now)*100:+.2f}% vs Spot")
+                col_p3.metric("🛡️ Put Wall (Piso Activo)", f"${p_wall:g}", f"{((p_wall - spot_now)/spot_now)*100:+.2f}% vs Spot")
+                if not tac["pin_df"].empty:
+                    pin_show = tac["pin_df"].rename(columns={
+                        "strike": "Strike",
+                        "pin_score": "Pin Score (0-100)",
+                        "dist_pct": "Distancia Spot (%)",
+                        "call_oi": "Call OI",
+                        "put_oi": "Put OI",
+                        "net_gex": "Net GEX",
+                        "role": "Rol Operativo",
+                    })
+                    st.dataframe(pin_show, use_container_width=True, hide_index=True)
+                st.caption("💡 **Pin Risk (0-100):** Combina concentración de OI (30%), cercanía al Spot (25%), peso de vencimientos cortos (25%) y magnitud Gamma (20%). Un score >65 indica fuerte atracción/freno en ese strike.")
+
+            with tab_radar:
+                c_prem = tac["total_call_prem_vol"]
+                p_prem = tac["total_put_prem_vol"]
+                tot_prem = c_prem + p_prem
+                c_pct = (c_prem / tot_prem * 100.0) if tot_prem > 0 else 50.0
+                p_pct = (p_prem / tot_prem * 100.0) if tot_prem > 0 else 50.0
+
+                r_c1, r_c2, r_c3 = st.columns(3)
+                r_c1.metric("🟢 Prima Operada en Calls (Hoy)", f"${c_prem:,.0f}", f"{c_pct:.1f}% del volumen en $")
+                r_c2.metric("🔴 Prima Operada en Puts (Hoy)", f"${p_prem:,.0f}", f"{p_pct:.1f}% del volumen en $")
+                r_c3.metric("📐 Expected Move Venc. Frontal", f"±${tac['em_exp']:.2f} (±{tac['em_exp_pct']:.1f}%)", f"DTE más cercano: {tac['min_dte']} días")
+
+                if not tac["radar_df"].empty:
+                    radar_show = tac["radar_df"].rename(columns={
+                        "contract_type": "Tipo",
+                        "strike": "Strike",
+                        "dte": "DTE",
+                        "volume": "Volumen Hoy",
+                        "open_interest": "Open Interest",
+                        "vol_oi_ratio": "Ratio Vol/OI",
+                        "prem_vol_usd": "Prima Operada ($)",
+                        "delta": "Delta",
+                        "signal": "Señal de Flujo",
+                    })
+                    st.dataframe(radar_show, use_container_width=True, hide_index=True)
+                st.caption("💡 **Cómo detectar entradas institucionales:** Cuando el **Ratio Vol/OI es > 1.0x** (y especialmente > 2.0x, marcado con 🔥), significa que están entrando contratos nuevos agresivos hoy que superan todo lo que había abierto antes.")
 
             # Fila 5: Gráficas de Exposición Verticales con Filtro de Rango Dinámico
             st.markdown("<h2 class='custom-header'>Gráficos de Exposición y Flujos</h2>", unsafe_allow_html=True)
