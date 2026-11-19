@@ -700,37 +700,21 @@ def calculate_tactical_metrics(df_gex, df_raw, spot, live_flow=None):
     else:
         pin_strike = spot
         pin_score = 0.0
-
-    # Si FlashAlpha devolvió pin_risk directo de la API, respetar si trae score/strike válido
-    # asegurando que pin_strike y pin_score siempre correspondan al mismo strike
-    pr_api = live_flow.get("pin_risk") or {}
-    if isinstance(pr_api, dict):
-        api_ps = pr_api.get("pin_score")
-        if api_ps is None:
-            api_ps = pr_api.get("score")
-        api_st = pr_api.get("pin_strike")
-        if api_st is None:
-            api_st = pr_api.get("magnet_strike")
-        if api_st is None:
-            api_st = pr_api.get("strike")
-
-        if api_st is not None:
-            try:
-                api_st_val = float(api_st)
-                pin_strike = api_st_val
-                if api_ps is not None:
+        # Solo usar pin_risk de FlashAlpha como respaldo si la tabla local está vacía
+        pr_api = live_flow.get("pin_risk") or {}
+        if isinstance(pr_api, dict):
+            api_st = pr_api.get("pin_strike") or pr_api.get("magnet_strike") or pr_api.get("strike")
+            api_ps = pr_api.get("pin_score") or pr_api.get("score")
+            if api_st is not None:
+                try:
+                    pin_strike = float(api_st)
+                except Exception:
+                    pass
+            if api_ps is not None:
+                try:
                     pin_score = float(api_ps)
-                elif not pin_df.empty:
-                    matched = pin_df[(pin_df["strike"] - api_st_val).abs() < 1e-6]
-                    if not matched.empty:
-                        pin_score = float(matched.iloc[0]["pin_score"])
-            except Exception:
-                pass
-        elif api_ps is not None:
-            try:
-                pin_score = float(api_ps)
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
     if pin_score >= 65:
         pin_label = "ALTO"
@@ -763,16 +747,15 @@ def calculate_tactical_metrics(df_gex, df_raw, spot, live_flow=None):
         def classify_signal(r):
             vol = float(r.get("volume", 0) or 0)
             ratio = float(r.get("vol_oi_ratio", 0) or 0)
-            ctype = r.get("contract_type", "CALL")
             if vol <= 0:
-                return "⏸️ Sin Volumen Hoy"
+                return "⏸️ Sin Volumen"
             if ratio >= 2.0:
-                return f"🔥 Apertura Masiva ({ctype})"
+                return "🔥 Apertura Masiva"
             if ratio >= 0.75:
-                return f"⚡ Flujo Activo Nuevo ({ctype})"
+                return "⚡ Flujo Activo"
             if ratio >= 0.25:
-                return f"📈 Rotación Moderada ({ctype})"
-            return "🏛️ Posición Estructural (OI)"
+                return "📈 Rotación Mod."
+            return "🏛️ Posición OI"
 
         df_r["signal"] = df_r.apply(classify_signal, axis=1)
         df_r["sort_key"] = df_r["prem_vol_usd"] + df_r["open_interest"] * 10.0

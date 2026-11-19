@@ -805,8 +805,86 @@ if st.session_state.expirations:
             em_high = tac["em_high_1d"]
             atm_iv_pct = tac["atm_iv"] * 100.0
 
+            # Rastreador de tendencia de IV ATM en vivo (por ticker y vencimientos en la sesión)
+            iv_hist_key = f"{ticker}|{'_'.join(map(str, selected_expirations))}"
+            if "iv_history_map" not in st.session_state:
+                st.session_state.iv_history_map = {}
+            iv_hist = st.session_state.iv_history_map.get(iv_hist_key, [])
+            cur_ts_lbl = st.session_state.get("last_updated_str") or datetime.now().strftime("%H:%M:%S")
+            if not iv_hist or iv_hist[-1]["ts"] != cur_ts_lbl:
+                iv_hist.append({"ts": cur_ts_lbl, "iv": round(atm_iv_pct, 2)})
+                iv_hist = iv_hist[-20:]
+                st.session_state.iv_history_map[iv_hist_key] = iv_hist
+
+            iv_base = iv_hist[0]["iv"]
+            if len(iv_hist) >= 2:
+                iv_prev = iv_hist[-2]["iv"]
+                iv_diff_prev = atm_iv_pct - iv_prev
+                iv_diff_base = atm_iv_pct - iv_base
+                iv_ref_diff = iv_diff_prev if abs(iv_diff_prev) >= 0.1 else iv_diff_base
+                if iv_ref_diff >= 0.15:
+                    iv_state = "up"
+                    iv_badge_txt = f"▲ +{iv_ref_diff:.1f}% SUBIENDO"
+                    iv_badge_fg = "#ff4d4d"
+                    iv_badge_bg = "rgba(255,77,77,0.18)"
+                elif iv_ref_diff <= -0.15:
+                    iv_state = "down"
+                    iv_badge_txt = f"▼ {iv_ref_diff:.1f}% BAJANDO"
+                    iv_badge_fg = "#2ecc71"
+                    iv_badge_bg = "rgba(46,204,113,0.18)"
+                else:
+                    iv_state = "flat"
+                    iv_badge_txt = f"● ESTABLE ({iv_ref_diff:+.1f}%)"
+                    iv_badge_fg = "#8b949e"
+                    iv_badge_bg = "rgba(139,148,158,0.18)"
+                iv_meta_extra = f" · Base: <b>{iv_base:.1f}%</b>"
+            else:
+                iv_state = "base"
+                iv_badge_txt = "● BASE"
+                iv_badge_fg = "#8b949e"
+                iv_badge_bg = "rgba(139,148,158,0.18)"
+                iv_meta_extra = " · Refresca para tendencia"
+
             vex_color = "#2ecc71" if net_vex_val >= 0 else "#ff4d4d"
-            vex_sub = "Si IV baja → Dealers compran (Alcista)" if net_vex_val >= 0 else "Si IV sube → Acelera ventas (Bajista)"
+            vex_border_color = vex_color
+            vex_pill_txt = "EN ESPERA"
+            vex_pill_fg = "#8b949e"
+            vex_pill_bg = "rgba(139,148,158,0.18)"
+            if net_vex_val < 0:
+                if iv_state == "up":
+                    vex_sub = "VEX negativo + IV subiendo → Aceleración bajista ACTIVA"
+                    vex_sub_color = "#ff4d4d"
+                    vex_pill_txt = "ACTIVA"
+                    vex_pill_fg = "#ff4d4d"
+                    vex_pill_bg = "rgba(255,77,77,0.20)"
+                elif iv_state == "down":
+                    vex_sub = "IV bajando → Presión Vanna cediendo (posible freno/rebote)"
+                    vex_sub_color = "#2ecc71"
+                    vex_border_color = "#2ecc71"
+                    vex_pill_txt = "CEDIENDO"
+                    vex_pill_fg = "#2ecc71"
+                    vex_pill_bg = "rgba(46,204,113,0.18)"
+                else:
+                    vex_sub = "Si IV sube → Acelera ventas (Bajista)"
+                    vex_sub_color = "#c9d1d9"
+            else:
+                if iv_state == "down":
+                    vex_sub = "VEX positivo + IV bajando → Empuje alcista ACTIVO"
+                    vex_sub_color = "#2ecc71"
+                    vex_pill_txt = "ACTIVO"
+                    vex_pill_fg = "#2ecc71"
+                    vex_pill_bg = "rgba(46,204,113,0.18)"
+                elif iv_state == "up":
+                    vex_sub = "IV subiendo → Empuje Vanna frenado / cautela"
+                    vex_sub_color = "#ffcc00"
+                    vex_border_color = "#ffcc00"
+                    vex_pill_txt = "FRENADO"
+                    vex_pill_fg = "#ffcc00"
+                    vex_pill_bg = "rgba(255,204,0,0.18)"
+                else:
+                    vex_sub = "Si IV baja → Dealers compran (Alcista)"
+                    vex_sub_color = "#c9d1d9"
+
             chex_color = "#2ecc71" if net_chex_val >= 0 else "#ff4d4d"
             chex_sub = "Paso del tiempo → Empuje alcista" if net_chex_val >= 0 else "Paso del tiempo → Presión bajista"
             pin_color = "#ffcc00" if pin_sc >= 65 else ("#2ecc71" if pin_sc >= 40 else "#8b949e")
@@ -814,10 +892,13 @@ if st.session_state.expirations:
             t_col1, t_col2, t_col3, t_col4 = st.columns(4)
             with t_col1:
                 st.markdown(
-                    f'<div style="background:#161b22;border:1px solid #30363d;border-left:4px solid {vex_color};border-radius:8px;padding:12px 16px;">'
-                    f'<p style="color:#8b949e;margin:0;font-size:12px;">VEX Neto (Vanna Exposure)</p>'
+                    f'<div style="background:#161b22;border:1px solid #30363d;border-left:4px solid {vex_border_color};border-radius:8px;padding:12px 16px;">'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">'
+                    f'<span style="color:#8b949e;font-size:12px;">VEX Neto (Vanna Exposure)</span>'
+                    f'<span style="background:{vex_pill_bg};color:{vex_pill_fg};font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;">{vex_pill_txt}</span>'
+                    f'</div>'
                     f'<p style="color:{vex_color};margin:4px 0 2px 0;font-size:22px;font-weight:800;">{format_millions(net_vex_val, engine_mode)}</p>'
-                    f'<p style="color:#c9d1d9;margin:0;font-size:11px;">{vex_sub}</p>'
+                    f'<p style="color:{vex_sub_color};margin:0;font-size:11px;">{vex_sub}</p>'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
@@ -842,9 +923,12 @@ if st.session_state.expirations:
             with t_col4:
                 st.markdown(
                     f'<div style="background:#161b22;border:1px solid #30363d;border-left:4px solid #348feb;border-radius:8px;padding:12px 16px;">'
-                    f'<p style="color:#8b949e;margin:0;font-size:12px;">Expected Move Hoy (IV {atm_iv_pct:.1f}%)</p>'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;flex-wrap:wrap;">'
+                    f'<span style="color:#8b949e;font-size:12px;">Expected Move · <b style="color:#ffffff;">IV {atm_iv_pct:.1f}%</b></span>'
+                    f'<span style="background:{iv_badge_bg};color:{iv_badge_fg};font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;">{iv_badge_txt}</span>'
+                    f'</div>'
                     f'<p style="color:#ffffff;margin:4px 0 2px 0;font-size:22px;font-weight:800;">±${em_1d:.2f} <span style="font-size:13px;color:#348feb;">(±{em_1d_pct:.1f}%)</span></p>'
-                    f'<p style="color:#c9d1d9;margin:0;font-size:11px;">Rango: <b>${em_low:.2f}</b> ◄──► <b>${em_high:.2f}</b></p>'
+                    f'<p style="color:#c9d1d9;margin:0;font-size:11px;">Rango: <b>${em_low:.2f}</b> ◄──► <b>${em_high:.2f}</b>{iv_meta_extra}</p>'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
@@ -979,6 +1063,40 @@ if st.session_state.expirations:
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 )
                 st.plotly_chart(fig_vex, use_container_width=True)
+                # Barra compacta de historial de IV ATM en la sesión
+                iv_trail_txt = "  →  ".join([f"{pt['ts'][:5]}: {pt['iv']:.1f}%" for pt in iv_hist[-6:]])
+                if len(iv_hist) == 1:
+                    spark_svg = (
+                        f'<svg width="150" height="30" viewBox="0 0 150 30">'
+                        f'<line x1="6" y1="15" x2="144" y2="15" stroke="{iv_badge_fg}" stroke-dasharray="4 4" stroke-width="1.5" opacity="0.6"/>'
+                        f'<circle cx="75" cy="15" r="3.5" fill="{iv_badge_fg}"/></svg>'
+                    )
+                else:
+                    pts_v = [pt["iv"] for pt in iv_hist[-10:]]
+                    v_min = min(pts_v) - 0.25
+                    v_max = max(pts_v) + 0.25
+                    coords = []
+                    for idx_p, val_p in enumerate(pts_v):
+                        px = 6 + (idx_p / max(len(pts_v) - 1, 1)) * 138
+                        py = 25 - ((val_p - v_min) / max(v_max - v_min, 0.01)) * 20
+                        coords.append((px, py))
+                    poly_str = " ".join([f"{x:.1f},{y:.1f}" for x, y in coords])
+                    dots_str = "".join([
+                        f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{3.5 if i == len(coords) - 1 else 2}" fill="{iv_badge_fg}"/>'
+                        for i, (x, y) in enumerate(coords)
+                    ])
+                    spark_svg = (
+                        f'<svg width="150" height="30" viewBox="0 0 150 30">'
+                        f'<polyline fill="none" stroke="{iv_badge_fg}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="{poly_str}"/>'
+                        f'{dots_str}</svg>'
+                    )
+                st.markdown(
+                    f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 14px;margin-top:6px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">'
+                    f'<div><div style="color:#ffffff;font-size:12px;font-weight:700;">Historial de IV ATM en tu sesión <span style="color:#8b949e;font-weight:400;">(con cada actualización)</span></div>'
+                    f'<div style="color:#c9d1d9;font-size:12px;font-family:monospace;margin-top:2px;">{iv_trail_txt}</div></div>'
+                    f'{spark_svg}</div>',
+                    unsafe_allow_html=True,
+                )
                 st.caption("💡 **Cómo leer VEX:** En strikes con VEX positivo (verde), una caída de la Volatilidad Implícita (IV) obliga a los dealers a **comprar subyacente** (combustible alcista). En strikes con VEX negativo (azul), una subida de IV acelera las ventas.")
 
             with tab_chex:
@@ -1009,16 +1127,39 @@ if st.session_state.expirations:
                 col_p2.metric("🧱 Call Wall (Techo Activo)", f"${c_wall:g}", f"{((c_wall - spot_now)/spot_now)*100:+.2f}% vs Spot")
                 col_p3.metric("🛡️ Put Wall (Piso Activo)", f"${p_wall:g}", f"{((p_wall - spot_now)/spot_now)*100:+.2f}% vs Spot")
                 if not tac["pin_df"].empty:
-                    pin_show = tac["pin_df"].rename(columns={
-                        "strike": "Strike",
-                        "pin_score": "Pin Score (0-100)",
-                        "dist_pct": "Distancia Spot (%)",
-                        "call_oi": "Call OI",
-                        "put_oi": "Put OI",
-                        "net_gex": "Net GEX",
-                        "role": "Rol Operativo",
-                    })
-                    st.dataframe(pin_show, use_container_width=True, hide_index=True)
+                    pin_rows_html = ""
+                    for _, pr in tac["pin_df"].iterrows():
+                        gex_v = float(pr["net_gex"])
+                        gex_clr = "#2ecc71" if gex_v > 0 else ("#ff4d4d" if gex_v < 0 else "#8b949e")
+                        dist_v = float(pr["dist_pct"])
+                        dist_clr = "#2ecc71" if dist_v >= 0 else "#ff4d4d"
+                        pin_rows_html += (
+                            f'<tr style="border-bottom:1px solid #21262d;">'
+                            f'<td style="padding:7px 8px;text-align:right;font-weight:700;color:#ffffff;">${float(pr["strike"]):g}</td>'
+                            f'<td style="padding:7px 8px;text-align:right;font-weight:700;color:#ffcc00;">{float(pr["pin_score"]):.1f}</td>'
+                            f'<td style="padding:7px 8px;text-align:right;color:{dist_clr};">{dist_v:+.2f}%</td>'
+                            f'<td style="padding:7px 8px;text-align:right;color:#c9d1d9;">{int(pr["call_oi"]):,}</td>'
+                            f'<td style="padding:7px 8px;text-align:right;color:#c9d1d9;">{int(pr["put_oi"]):,}</td>'
+                            f'<td style="padding:7px 8px;text-align:right;color:{gex_clr};font-weight:600;">{format_millions(gex_v, engine_mode)}</td>'
+                            f'<td style="padding:7px 8px;text-align:left;color:#e6edf3;white-space:nowrap;">{pr["role"]}</td>'
+                            f'</tr>'
+                        )
+                    pin_tbl_html = (
+                        '<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;overflow:hidden;margin:8px 0 10px 0;">'
+                        '<table style="width:100%;border-collapse:collapse;font-size:12.5px;font-family:\'Inter\',sans-serif;">'
+                        '<thead><tr style="background:#161b22;border-bottom:1px solid #30363d;color:#8b949e;">'
+                        '<th style="padding:8px;text-align:right;">Strike</th>'
+                        '<th style="padding:8px;text-align:right;">Pin Score</th>'
+                        '<th style="padding:8px;text-align:right;">Dist. Spot</th>'
+                        '<th style="padding:8px;text-align:right;">Call OI</th>'
+                        '<th style="padding:8px;text-align:right;">Put OI</th>'
+                        '<th style="padding:8px;text-align:right;">Net GEX</th>'
+                        '<th style="padding:8px;text-align:left;">Rol Operativo</th>'
+                        '</tr></thead>'
+                        f'<tbody>{pin_rows_html}</tbody>'
+                        '</table></div>'
+                    )
+                    st.markdown(pin_tbl_html, unsafe_allow_html=True)
                 st.caption("💡 **Pin Risk (0-100):** Combina concentración de OI (30%), cercanía al Spot (25%), peso de vencimientos cortos (25%) y magnitud Gamma (20%). Un score >65 indica fuerte atracción/freno en ese strike.")
 
             with tab_radar:
@@ -1034,18 +1175,47 @@ if st.session_state.expirations:
                 r_c3.metric("📐 Expected Move Venc. Frontal", f"±${tac['em_exp']:.2f} (±{tac['em_exp_pct']:.1f}%)", f"DTE más cercano: {tac['min_dte']} días")
 
                 if not tac["radar_df"].empty:
-                    radar_show = tac["radar_df"].rename(columns={
-                        "contract_type": "Tipo",
-                        "strike": "Strike",
-                        "dte": "DTE",
-                        "volume": "Volumen Hoy",
-                        "open_interest": "Open Interest",
-                        "vol_oi_ratio": "Ratio Vol/OI",
-                        "prem_vol_usd": "Prima Operada ($)",
-                        "delta": "Delta",
-                        "signal": "Señal de Flujo",
-                    })
-                    st.dataframe(radar_show, use_container_width=True, hide_index=True)
+                    radar_rows_html = ""
+                    for _, rr in tac["radar_df"].iterrows():
+                        ctype = str(rr["contract_type"])
+                        type_clr = "#2ecc71" if ctype == "CALL" else "#ff4d4d"
+                        type_bg = "rgba(46,204,113,0.14)" if ctype == "CALL" else "rgba(255,77,77,0.14)"
+                        ratio_v = float(rr["vol_oi_ratio"])
+                        ratio_clr = "#ffcc00" if ratio_v >= 2.0 else ("#348feb" if ratio_v >= 0.75 else "#c9d1d9")
+                        prem_v = float(rr["prem_vol_usd"])
+                        prem_txt = format_millions(prem_v, "USD") if prem_v >= 100000 else f"${prem_v:,.0f}"
+                        sig_txt = str(rr["signal"]).replace(" (CALL)", "").replace(" (PUT)", "")
+                        radar_rows_html += (
+                            f'<tr style="border-bottom:1px solid #21262d;">'
+                            f'<td style="padding:6px 6px;text-align:center;"><span style="background:{type_bg};color:{type_clr};font-weight:700;padding:2px 6px;border-radius:4px;font-size:11px;">{ctype}</span></td>'
+                            f'<td style="padding:6px 6px;text-align:right;font-weight:700;color:#ffffff;">${float(rr["strike"]):g}</td>'
+                            f'<td style="padding:6px 6px;text-align:right;color:#8b949e;">{int(rr["dte"])}d</td>'
+                            f'<td style="padding:6px 6px;text-align:right;color:#e6edf3;font-weight:600;">{int(rr["volume"]):,}</td>'
+                            f'<td style="padding:6px 6px;text-align:right;color:#c9d1d9;">{int(rr["open_interest"]):,}</td>'
+                            f'<td style="padding:6px 6px;text-align:right;color:{ratio_clr};font-weight:700;">{ratio_v:.2f}x</td>'
+                            f'<td style="padding:6px 6px;text-align:right;color:#e6edf3;font-weight:600;">{prem_txt}</td>'
+                            f'<td style="padding:6px 6px;text-align:right;color:#8b949e;">{float(rr["delta"]):.2f}</td>'
+                            f'<td style="padding:6px 6px;text-align:left;color:#e6edf3;white-space:nowrap;">{sig_txt}</td>'
+                            f'</tr>'
+                        )
+                    radar_tbl_html = (
+                        '<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;overflow:hidden;margin:8px 0 10px 0;">'
+                        '<table style="width:100%;border-collapse:collapse;font-size:12px;font-family:\'Inter\',sans-serif;">'
+                        '<thead><tr style="background:#161b22;border-bottom:1px solid #30363d;color:#8b949e;">'
+                        '<th style="padding:7px 6px;text-align:center;">Tipo</th>'
+                        '<th style="padding:7px 6px;text-align:right;">Strike</th>'
+                        '<th style="padding:7px 6px;text-align:right;">DTE</th>'
+                        '<th style="padding:7px 6px;text-align:right;">Vol</th>'
+                        '<th style="padding:7px 6px;text-align:right;">OI</th>'
+                        '<th style="padding:7px 6px;text-align:right;">Vol/OI</th>'
+                        '<th style="padding:7px 6px;text-align:right;">Prima ($)</th>'
+                        '<th style="padding:7px 6px;text-align:right;">Delta</th>'
+                        '<th style="padding:7px 6px;text-align:left;">Señal</th>'
+                        '</tr></thead>'
+                        f'<tbody>{radar_rows_html}</tbody>'
+                        '</table></div>'
+                    )
+                    st.markdown(radar_tbl_html, unsafe_allow_html=True)
                 st.caption("💡 **Cómo detectar entradas institucionales:** Cuando el **Ratio Vol/OI es > 1.0x** (y especialmente > 2.0x, marcado con 🔥), significa que están entrando contratos nuevos agresivos hoy que superan todo lo que había abierto antes.")
 
             # Fila 5: Gráficas de Exposición Verticales con Filtro de Rango Dinámico
