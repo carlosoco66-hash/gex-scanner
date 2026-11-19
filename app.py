@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import time
+from datetime import datetime
 import importlib
 import plotly.graph_objects as go
 import streamlit.components.v1 as components
@@ -47,12 +48,12 @@ def _fallback_tactical_metrics(df_gex, df_raw, spot, live_flow=None):
 
 calculate_tactical_metrics = getattr(gex_engine, "calculate_tactical_metrics", _fallback_tactical_metrics)
 
-# Funciones con caché para optimizar consultas de la API
+# Funciones con caché para optimizar consultas de la API (60s para datos en vivo)
 @st.cache_data(ttl=300)
 def cached_options_expirations(ticker, api_key):
     return get_options_expirations(ticker, api_key)
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)
 def cached_fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, mode):
     return fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, mode=mode)
 
@@ -149,10 +150,11 @@ rango_pct = st.sidebar.slider(
     step=5
 )
 
-# Botón para forzar actualización (limpia la caché)
+# Botón para forzar actualización (limpia la caché y fuerza recálculo en sesión)
 if st.sidebar.button("🔄 Forzar Actualización", use_container_width=True):
     st.cache_data.clear()
-    st.sidebar.success("Caché limpiada con éxito.")
+    st.session_state.force_refresh = True
+    st.sidebar.success("Caché limpiada. Actualizando datos en vivo...")
     st.rerun()
 
 
@@ -445,13 +447,29 @@ if st.session_state.expirations:
         default=st.session_state.expirations[0] if st.session_state.expirations else []
     )
     
-    col_calc_btn, _ = st.columns([2, 5])
+    col_calc_btn, col_refresh_btn, col_ts = st.columns([2, 2, 3])
     with col_calc_btn:
         btn_calc = st.button("3. Calcular GEX y Scanner", use_container_width=True, type="primary")
+    with col_refresh_btn:
+        btn_refresh_live = st.button("🔄 Actualizar En Vivo", use_container_width=True)
+        if btn_refresh_live:
+            cached_fetch_and_calculate_all.clear()
+            cached_fetch_live_flow.clear()
+            st.session_state.force_refresh = True
+    with col_ts:
+        ts_placeholder = st.empty()
 
-    # Si se hace clic en calcular, corremos el scanner
-    if btn_calc or 'gex_results' in st.session_state:
-        if btn_calc or ticker != st.session_state.get('results_ticker') or engine_mode != st.session_state.get('results_mode'):
+    # Si se hace clic en calcular o actualizar, corremos el scanner
+    force_refresh = st.session_state.pop("force_refresh", False)
+    exp_key = tuple(selected_expirations)
+    if btn_calc or force_refresh or 'gex_results' in st.session_state:
+        if (
+            btn_calc
+            or force_refresh
+            or ticker != st.session_state.get('results_ticker')
+            or engine_mode != st.session_state.get('results_mode')
+            or exp_key != st.session_state.get('results_exps')
+        ):
             with st.spinner("Descargando libro de opciones y calculando GEX..."):
                 df_gex, df_dex, df_raw, spot = cached_fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, mode=engine_mode)
                 
@@ -465,7 +483,16 @@ if st.session_state.expirations:
                     st.session_state.raw_data = df_raw
                     st.session_state.results_ticker = ticker
                     st.session_state.results_mode = engine_mode
-        
+                    st.session_state.results_exps = exp_key
+                    st.session_state.last_updated_str = datetime.now().strftime("%H:%M:%S")
+
+        last_ts = st.session_state.get("last_updated_str")
+        if last_ts:
+            ts_placeholder.markdown(
+                f"<div style='padding-top:8px;color:#8b949e;font-size:13px;'>🕒 Última actualización: <b style='color:#c9d1d9;'>{last_ts}</b> (caché 60s)</div>",
+                unsafe_allow_html=True,
+            )
+
         # Mostrar Resultados si existen en sesión
         if 'gex_results' in st.session_state:
             res = st.session_state.gex_results
@@ -862,6 +889,54 @@ if st.session_state.expirations:
                 else "GAMMA POSITIVA (Mercado amortiguado / Reversión a la media)"
             )
 
+            # Construir Plan Long y Plan Short respetando el orden real de los niveles
+            if p_wall < em_low < spot_now and (em_low - p_wall) > 0.05:
+                long_support_txt = f"piso diario (<b>${em_low:.2f}</b>) o Put Wall (<b>${p_wall:g}</b>)"
+            elif p_wall < spot_now:
+                long_support_txt = f"soporte/Put Wall en <b>${p_wall:g}</b>"
+            else:
+                long_support_txt = f"recuperación sobre <b>${p_wall:g}</b>"
+
+            long_targets = []
+            if abs(pin_st - c_wall) < 1e-6:
+                if c_wall > p_wall + 1e-6:
+                    long_targets.append((c_wall, f"Imán/Call Wall <b>${c_wall:g}</b>"))
+            else:
+                if pin_st > p_wall + 1e-6:
+                    long_targets.append((pin_st, f"Imán/Pin <b>${pin_st:g}</b>"))
+                if c_wall > p_wall + 1e-6:
+                    long_targets.append((c_wall, f"Call Wall <b>${c_wall:g}</b>"))
+            long_targets.sort(key=lambda item: item[0])
+
+            if len(long_targets) == 2:
+                conj = "e" if long_targets[1][1].startswith("Imán") else "y"
+                long_target_txt = f"apuntando a {long_targets[0][1]} {conj} {long_targets[1][1]}"
+            elif len(long_targets) == 1:
+                long_target_txt = f"apuntando a {long_targets[0][1]}"
+            else:
+                long_target_txt = f"apuntando al techo diario (<b>${em_high:.2f}</b>)"
+
+            plan_long_html = (
+                f"• <b>Plan Long:</b> Buscar compras si sostiene {long_support_txt} (con IV estable o bajando), "
+                f"{long_target_txt}. Evitar perseguir arriba del límite diario (<b>${em_high:.2f}</b>)."
+            )
+
+            if em_low < p_wall - 0.05:
+                plan_short_html = (
+                    f"• <b>Plan Short:</b> Si pierde el Put Wall (<b>${p_wall:g}</b>) con aumento de IV y flujo vendedor, "
+                    f"hay riesgo de aceleración rápida hacia el piso del rango esperado (<b>${em_low:.2f}</b>)."
+                )
+            elif em_low > p_wall + 0.05:
+                plan_short_html = (
+                    f"• <b>Plan Short:</b> Si pierde el piso del rango esperado (<b>${em_low:.2f}</b>) con aumento de IV y flujo vendedor, "
+                    f"hay riesgo de aceleración hacia el Put Wall (<b>${p_wall:g}</b>); perder <b>${p_wall:g}</b> abriría extensión bajista fuera del rango diario."
+                )
+            else:
+                plan_short_html = (
+                    f"• <b>Plan Short:</b> Si pierde la confluencia de Put Wall y piso diario (<b>${p_wall:g}</b>) con aumento de IV y flujo vendedor, "
+                    f"hay riesgo de extensión bajista acelerada fuera del rango esperado."
+                )
+
             verdict_html = (
                 f'<div style="background:#0b0e14;border:1.5px solid {v_border};border-radius:10px;padding:14px 18px;margin-top:14px;margin-bottom:16px;">'
                 f'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:6px;">'
@@ -869,8 +944,8 @@ if st.session_state.expirations:
                 f'<span style="color:#8b949e;font-size:12px;font-family:monospace;">Régimen: {gex_regime_txt}</span>'
                 f'</div>'
                 f'<div style="color:#d0d7de;font-size:13.5px;line-height:1.55;">'
-                f'• <b>Plan Long:</b> Buscar compras si sostiene soporte/Put Wall en <b>${p_wall:g}</b> (con IV estable o bajando), apuntando al Imán/Pin <b>${pin_st:g}</b> y Call Wall <b>${c_wall:g}</b>. Evitar perseguir arriba del límite diario (<b>${em_high:.2f}</b>).<br>'
-                f'• <b>Plan Short:</b> Si pierde <b>${p_wall:g}</b> con aumento de IV y flujo vendedor, hay riesgo de aceleración rápida hacia el piso del rango esperado (<b>${em_low:.2f}</b>).'
+                f'{plan_long_html}<br>'
+                f'{plan_short_html}'
                 f'</div>'
                 f'</div>'
             )

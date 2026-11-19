@@ -702,18 +702,33 @@ def calculate_tactical_metrics(df_gex, df_raw, spot, live_flow=None):
         pin_score = 0.0
 
     # Si FlashAlpha devolvió pin_risk directo de la API, respetar si trae score/strike válido
+    # asegurando que pin_strike y pin_score siempre correspondan al mismo strike
     pr_api = live_flow.get("pin_risk") or {}
     if isinstance(pr_api, dict):
-        api_ps = pr_api.get("pin_score") or pr_api.get("score")
-        api_st = pr_api.get("pin_strike") or pr_api.get("magnet_strike") or pr_api.get("strike")
-        if api_ps is not None:
-            try:
-                pin_score = float(api_ps)
-            except Exception:
-                pass
+        api_ps = pr_api.get("pin_score")
+        if api_ps is None:
+            api_ps = pr_api.get("score")
+        api_st = pr_api.get("pin_strike")
+        if api_st is None:
+            api_st = pr_api.get("magnet_strike")
+        if api_st is None:
+            api_st = pr_api.get("strike")
+
         if api_st is not None:
             try:
-                pin_strike = float(api_st)
+                api_st_val = float(api_st)
+                pin_strike = api_st_val
+                if api_ps is not None:
+                    pin_score = float(api_ps)
+                elif not pin_df.empty:
+                    matched = pin_df[(pin_df["strike"] - api_st_val).abs() < 1e-6]
+                    if not matched.empty:
+                        pin_score = float(matched.iloc[0]["pin_score"])
+            except Exception:
+                pass
+        elif api_ps is not None:
+            try:
+                pin_score = float(api_ps)
             except Exception:
                 pass
 
