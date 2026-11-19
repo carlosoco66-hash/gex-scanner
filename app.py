@@ -8,24 +8,22 @@ from gex_engine import (
     get_live_spot_price,
     get_options_expirations,
     fetch_and_calculate_all,
-    calculate_levels
+    calculate_levels,
+    fetch_live_flow
 )
 
 # Funciones con caché para optimizar consultas de la API
 @st.cache_data(ttl=300)
 def cached_options_expirations(ticker, api_key):
-    res = get_options_expirations(ticker, api_key)
-    if not res:
-        st.cache_data.clear()
-    return res
+    return get_options_expirations(ticker, api_key)
 
 @st.cache_data(ttl=300)
 def cached_fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, mode):
-    res = fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, mode=mode)
-    df_gex, df_dex, df_raw, spot = res
-    if spot == 0 or df_gex.empty:
-        st.cache_data.clear()
-    return res
+    return fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, mode=mode)
+
+@st.cache_data(ttl=60)
+def cached_fetch_live_flow(ticker, api_key):
+    return fetch_live_flow(ticker, api_key)
 
 
 # Configuración de página
@@ -558,6 +556,187 @@ if st.session_state.expirations:
                     <p>• <b>NTrans:</b> soporte institucional principal.</p>
                 </div>
                 """, unsafe_allow_html=True)
+
+            # Fila 4.5: Panel PREMIUM FLOW (Estilo Institucional Puts | Strike | Calls)
+            st.markdown("<h2 class='custom-header'>1 · PREMIUM FLOW (Flujo de Dinero Institucional por Strike)</h2>", unsafe_allow_html=True)
+            col_pf1, col_pf2 = st.columns([2, 2])
+            with col_pf1:
+                pf_basis = st.selectbox(
+                    "Base del Cálculo de Prima ($)",
+                    ["Open Interest (Dinero Acumulado en Contratos)", "Volumen del Día (Flujo Operado Hoy)"],
+                    index=0
+                )
+            with col_pf2:
+                pf_rows = st.slider("Cantidad de Strikes alrededor del Spot", min_value=6, max_value=30, value=10, step=2)
+
+            if not df_gex.empty and 'call_prem_oi' in df_gex.columns:
+                use_vol = "Volumen" in pf_basis
+                c_col = 'call_prem_vol' if use_vol else 'call_prem_oi'
+                p_col = 'put_prem_vol' if use_vol else 'put_prem_oi'
+
+                # Si se eligió volumen pero el mercado está cerrado y el volumen es 0, usar OI automáticamente
+                if use_vol and (df_gex[c_col].sum() + df_gex[p_col].sum() == 0):
+                    c_col = 'call_prem_oi'
+                    p_col = 'put_prem_oi'
+
+                df_pf = df_gex.copy()
+                df_pf['dist'] = (df_pf['strike'] - res['Spot Price']).abs()
+                atm_strike = df_pf.loc[df_pf['dist'].idxmin()]['strike']
+
+                # Tomar los N strikes más cercanos al Spot y ordenarlos de mayor a menor (como en la imagen)
+                df_pf_sub = df_pf.nsmallest(pf_rows, 'dist').sort_values('strike', ascending=False).reset_index(drop=True)
+
+                total_put_prem = df_pf_sub[p_col].sum()
+                total_call_prem = df_pf_sub[c_col].sum()
+                max_put_cell = max(df_pf_sub[p_col].max(), 1.0)
+                max_call_cell = max(df_pf_sub[c_col].max(), 1.0)
+                exp_badge_txt = ", ".join(selected_expirations[:2]) + (f" (+{len(selected_expirations)-2})" if len(selected_expirations) > 2 else "")
+
+                rows_html = ""
+                for _, r_pf in df_pf_sub.iterrows():
+                    s_val = r_pf['strike']
+                    p_val = r_pf[p_col]
+                    c_val = r_pf[c_col]
+                    is_atm = abs(s_val - atm_strike) < 1e-6
+
+                    # Intensidad del mapa de calor (rojo para Puts, verde para Calls)
+                    p_ratio = min(max(p_val / max_put_cell, 0.15), 1.0)
+                    c_ratio = min(max(c_val / max_call_cell, 0.15), 1.0)
+
+                    p_r = int(95 + 145 * p_ratio)
+                    p_g = int(25 + 45 * (1.0 - p_ratio))
+                    p_b = int(25 + 45 * (1.0 - p_ratio))
+
+                    c_r = int(20 + 40 * (1.0 - c_ratio))
+                    c_g = int(95 + 135 * c_ratio)
+                    c_b = int(50 + 60 * c_ratio)
+
+                    s_str = f"{s_val:.0f}" if s_val == int(s_val) else f"{s_val:.2f}"
+                    row_border = "outline: 2.5px solid #ffcc00; box-shadow: 0 0 12px rgba(255, 204, 0, 0.55); position: relative; z-index: 2;" if is_atm else "border-bottom: 1px solid #1a1d24;"
+                    strike_bg = "#4d3b08" if is_atm else "#08090c"
+                    strike_color = "#ffd700" if is_atm else "#e6edf3"
+
+                    rows_html += f"""
+                    <tr style="{row_border}">
+                        <td style="background-color: rgb({p_r},{p_g},{p_b}); color: #ffffff; text-align: center; padding: 10px 12px; font-family: 'Courier New', monospace; font-weight: 700; font-size: 15px; width: 40%;">
+                            ${p_val:,.0f}
+                        </td>
+                        <td style="background-color: {strike_bg}; color: {strike_color}; text-align: center; padding: 10px 12px; font-family: 'Courier New', monospace; font-weight: 800; font-size: 15px; width: 20%;">
+                            {s_str}
+                        </td>
+                        <td style="background-color: rgb({c_r},{c_g},{c_b}); color: #06150a; text-align: center; padding: 10px 12px; font-family: 'Courier New', monospace; font-weight: 800; font-size: 15px; width: 40%;">
+                            ${c_val:,.0f}
+                        </td>
+                    </tr>
+                    """
+
+                pf_html = f"""
+                <div style="border: 1.5px solid #d4a017; border-radius: 10px; background-color: #08090c; padding: 16px 20px; margin-bottom: 25px; box-shadow: 0 4px 20px rgba(0,0,0,0.6);">
+                    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 6px;">
+                        <div style="display: flex; align-items: center; gap: 12px;">
+                            <span style="color: #f5b700; font-family: 'Courier New', monospace; font-size: 20px; font-weight: 800; letter-spacing: 0.5px;">Premium Flow</span>
+                            <span style="background-color: #161922; border: 1px solid #3a3f50; color: #d0d7de; padding: 2px 10px; border-radius: 12px; font-family: monospace; font-size: 13px;">{exp_badge_txt}</span>
+                        </div>
+                        <div style="font-family: 'Courier New', monospace; font-size: 16px; font-weight: 700;">
+                            <span style="color: #c9d1d9;">Put: </span><span style="color: #ff4d4d; margin-right: 16px;">${total_put_prem:,.0f}</span>
+                            <span style="color: #c9d1d9;">Call: </span><span style="color: #2ecc71;">${total_call_prem:,.0f}</span>
+                        </div>
+                    </div>
+                    <div style="color: #8b949e; font-family: 'Courier New', monospace; font-size: 13px; margin-bottom: 14px;">
+                        Spot: {res['Spot Price']:.2f} (ATM strike highlight: {atm_strike:g})
+                    </div>
+                    <table style="width: 100%; border-collapse: collapse; overflow: hidden; border-radius: 6px;">
+                        <thead>
+                            <tr style="border-bottom: 1px solid #262936;">
+                                <th style="color: #d4a017; text-align: center; padding: 8px; font-family: 'Courier New', monospace; font-size: 13px; letter-spacing: 1px;">PUTS</th>
+                                <th style="color: #d4a017; text-align: center; padding: 8px; font-family: 'Courier New', monospace; font-size: 13px; letter-spacing: 1px;">STRIKE</th>
+                                <th style="color: #d4a017; text-align: center; padding: 8px; font-family: 'Courier New', monospace; font-size: 13px; letter-spacing: 1px;">CALLS</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {rows_html}
+                        </tbody>
+                    </table>
+                </div>
+                """
+                st.markdown(pf_html, unsafe_allow_html=True)
+
+            # Fila 4.75: Panel FLUJO EN VIVO (FlashAlpha Live Flow)
+            st.markdown("<h2 class='custom-header'>2 · FLUJO EN VIVO (FlashAlpha Live Flow)</h2>", unsafe_allow_html=True)
+            live_flow = cached_fetch_live_flow(ticker, api_key)
+            lf_summary = live_flow.get("summary") or {}
+            lf_gex = live_flow.get("gex") or {}
+            lf_df = live_flow.get("strikes_df", pd.DataFrame())
+
+            if live_flow.get("error") and not lf_summary and lf_df.empty:
+                st.warning(f"No se pudo obtener el flujo en vivo: {live_flow['error']}")
+            else:
+                flow_dir = str(lf_summary.get("flow_direction", "no_flow"))
+                dir_map = {
+                    "bullish": ("ALCISTA (Compras)", "#2ecc71"),
+                    "bearish": ("BAJISTA (Ventas)", "#ff4d4d"),
+                    "neutral": ("NEUTRAL", "#ffcc00"),
+                    "no_flow": ("SIN FLUJO (Mercado Cerrado)", "#8b949e"),
+                }
+                dir_label, dir_color = dir_map.get(flow_dir.lower(), (flow_dir.upper(), "#ffffff"))
+
+                contracts_flow = int(lf_summary.get("contracts_with_flow", 0) or 0)
+                contracts_total = int(lf_summary.get("contracts_total", 0) or 0)
+                oi_delta = lf_summary.get("intraday_oi_delta", 0) or 0
+                live_net_gex_val = lf_gex.get("live_net_gex", lf_summary.get("live_gex", 0)) or 0
+                live_gex_lbl = str(lf_gex.get("live_net_gex_label", "")).upper()
+                pct_shift = float(lf_summary.get("flow_gex_pct_shift", 0) or 0)
+                live_flip = lf_gex.get("live_gamma_flip")
+
+                c_lf1, c_lf2, c_lf3, c_lf4 = st.columns(4)
+                with c_lf1:
+                    st.markdown(f"""
+                    <div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;">
+                        <p style="color:#8b949e;margin:0;font-size:12px;">Dirección del Flujo</p>
+                        <p style="color:{dir_color};margin:4px 0 0 0;font-size:20px;font-weight:800;">{dir_label}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with c_lf2:
+                    st.markdown(f"""
+                    <div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;">
+                        <p style="color:#8b949e;margin:0;font-size:12px;">Contratos con Flujo / Δ OI</p>
+                        <p style="color:#ffffff;margin:4px 0 0 0;font-size:20px;font-weight:700;">{contracts_flow:,} / {contracts_total:,} <span style="font-size:13px;color:#8b949e;">(Δ {oi_delta:+,})</span></p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with c_lf3:
+                    st.markdown(f"""
+                    <div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;">
+                        <p style="color:#8b949e;margin:0;font-size:12px;">Live Net GEX ({live_gex_lbl or 'FLOW'})</p>
+                        <p style="color:#ffffff;margin:4px 0 0 0;font-size:20px;font-weight:700;">{format_millions(live_net_gex_val, 'USD')} <span style="font-size:13px;color:#8b949e;">({pct_shift:+.2f}%)</span></p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with c_lf4:
+                    flip_txt = f"${float(live_flip):.2f}" if live_flip is not None else "N/A"
+                    st.markdown(f"""
+                    <div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;">
+                        <p style="color:#8b949e;margin:0;font-size:12px;">Live Gamma Flip</p>
+                        <p style="color:#ffcc00;margin:4px 0 0 0;font-size:20px;font-weight:700;">{flip_txt}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                if flow_dir.lower() == "no_flow":
+                    st.info("🕒 Mercado de opciones cerrado o sin flujo intradía aún (`no_flow`). Al abrir el mercado (9:30 AM ET), pulsa **Forzar Actualización** para ver la dirección en vivo.")
+
+                if not lf_df.empty:
+                    lf_spot = float(lf_gex.get("underlying_price") or res["Spot Price"] or 0.0)
+                    lf_sub = lf_df[
+                        (lf_df["strike"] >= lf_spot * (1 - rango_pct / 100.0))
+                        & (lf_df["strike"] <= lf_spot * (1 + rango_pct / 100.0))
+                    ].copy()
+
+                    if not lf_sub.empty:
+                        st.markdown("<h4 style='margin-top:16px;'>Top Strikes Activos (Live Flow GEX & Volumen)</h4>", unsafe_allow_html=True)
+                        top_flow_df = lf_sub.sort_values(["total_volume", "call_oi", "put_oi"], ascending=False).head(10)[
+                            ["strike", "call_volume", "put_volume", "call_oi", "put_oi", "call_gex", "put_gex", "net_gex"]
+                        ].copy()
+                        for int_c in ["call_volume", "put_volume", "call_oi", "put_oi"]:
+                            top_flow_df[int_c] = top_flow_df[int_c].astype(int)
+                        st.dataframe(top_flow_df, use_container_width=True, hide_index=True)
 
             # Fila 5: Gráficas de Exposición Verticales con Filtro de Rango Dinámico
             st.markdown("<h2 class='custom-header'>Gráficos de Exposición y Flujos</h2>", unsafe_allow_html=True)

@@ -4,63 +4,18 @@ import numpy as np
 import yfinance as yf
 import datetime
 
-import requests
-
 def get_live_spot_price(ticker):
-    """
-    Obtiene el precio spot en tiempo real con múltiples capas de respaldo (fallbacks)
-    para evitar fallos por bloqueos de Yahoo Finance o rate-limiting en la nube.
-    """
-    ticker = ticker.upper().strip()
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Accept-Language': 'en-US,en;q=0.9'
-    }
-
-    # 1. Yahoo Finance v8 chart API (Respuesta muy rápida y sin bloqueo de IP)
+    """Obtiene el precio spot en tiempo real usando yfinance."""
     try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d"
-        r = requests.get(url, headers=headers, timeout=4)
-        if r.status_code == 200:
-            data = r.json()
-            meta = data.get('chart', {}).get('result', [{}])[0].get('meta', {})
-            price = meta.get('regularMarketPrice')
-            if price and float(price) > 0:
-                return float(price)
-    except Exception as e:
-        print(f"Error en Yahoo v8 chart spot para {ticker}: {e}")
-
-    # 2. Yahoo Finance v7 quote API
-    try:
-        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
-        r = requests.get(url, headers=headers, timeout=4)
-        if r.status_code == 200:
-            data = r.json()
-            res = data.get('quoteResponse', {}).get('result', [])
-            if res:
-                price = res[0].get('regularMarketPrice') or res[0].get('postMarketPrice')
-                if price and float(price) > 0:
-                    return float(price)
-    except Exception as e:
-        print(f"Error en Yahoo v7 quote spot para {ticker}: {e}")
-
-    # 3. Fallback a yfinance clásico
-    try:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(ticker.upper())
         try:
-            val = float(t.fast_info['lastPrice'])
-            if val > 0:
-                return val
-        except Exception:
+            return float(t.fast_info['lastPrice'])
+        except:
             hist = t.history(period='1d')
             if not hist.empty:
-                val = float(hist['Close'].iloc[-1])
-                if val > 0:
-                    return val
+                return float(hist['Close'].iloc[-1])
     except Exception as e:
-        print(f"Error fetching yfinance spot para {ticker}: {e}")
-
+        print(f"Error fetching yfinance spot for {ticker}: {e}")
     return 0.0
 
 def get_options_expirations(ticker, api_key):
@@ -116,48 +71,52 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
                 lambda e: (datetime.datetime.strptime(e, "%Y-%m-%d").date() - today).days
             )
             
-            # Limpiar tipos y obtener IV
+            # Limpiar tipos
+            df_raw['gamma'] = pd.to_numeric(df_raw['gamma'], errors='coerce')
+            df_raw['delta'] = pd.to_numeric(df_raw['delta'], errors='coerce')
             df_raw['strike'] = pd.to_numeric(df_raw['strike'], errors='coerce')
-            df_raw['open_interest'] = pd.to_numeric(df_raw['open_interest'], errors='coerce').fillna(0.0)
-            df_raw['volume'] = pd.to_numeric(df_raw['volume'], errors='coerce').fillna(0.0)
             
-            iv_col = 'implied_vol' if 'implied_vol' in df_raw.columns else ('implied_volatility' if 'implied_volatility' in df_raw.columns else 'iv')
-            if iv_col in df_raw.columns:
-                df_raw['iv'] = pd.to_numeric(df_raw[iv_col], errors='coerce').fillna(0.20)
+            # Completar Gamma y Delta de Puts usando paridad Call-Put para corregir vacíos de la API
+            df_calls = df_raw[df_raw['type'] == 'C'][['strike', 'expiry', 'gamma', 'delta']].rename(
+                columns={'gamma': 'call_gamma', 'delta': 'call_delta'}
+            )
+            df_raw = df_raw.merge(df_calls, on=['strike', 'expiry'], how='left')
+            
+            df_raw['gamma'] = df_raw.apply(
+                lambda r: r['call_gamma'] if pd.notna(r['call_gamma']) else r['gamma'], 
+                axis=1
+            ).fillna(0.0).astype(float)
+            
+            df_raw['delta'] = df_raw.apply(
+                lambda r: (r['call_delta'] - 1.0) if r['type'] == 'P' and pd.notna(r['call_delta']) else r['delta'],
+                axis=1
+            ).fillna(0.0).astype(float)
+            
+            df_raw['open_interest'] = df_raw['open_interest'].fillna(0.0).astype(float)
+            df_raw['volume'] = df_raw['volume'].fillna(0.0).astype(float)
+            
+            # Extraer precio de la opción si viene en FlashAlpha (mid, last, mark, price o promedio bid/ask)
+            if 'mid' in df_raw.columns:
+                df_raw['opt_price'] = pd.to_numeric(df_raw['mid'], errors='coerce').fillna(0.0)
+            elif 'last' in df_raw.columns:
+                df_raw['opt_price'] = pd.to_numeric(df_raw['last'], errors='coerce').fillna(0.0)
+            elif 'price' in df_raw.columns:
+                df_raw['opt_price'] = pd.to_numeric(df_raw['price'], errors='coerce').fillna(0.0)
+            elif 'bid' in df_raw.columns and 'ask' in df_raw.columns:
+                b = pd.to_numeric(df_raw['bid'], errors='coerce').fillna(0.0)
+                a = pd.to_numeric(df_raw['ask'], errors='coerce').fillna(0.0)
+                df_raw['opt_price'] = (b + a) / 2.0
             else:
-                df_raw['iv'] = 0.20
+                df_raw['opt_price'] = 0.0
                 
-            # Calcular Gamma y Delta con Black-Scholes para asegurar precisión total en 1 o múltiples expiraciones
-            import math
-            gammas = []
-            deltas = []
-            r = 0.045
-            for idx, row in df_raw.iterrows():
-                k_strike = row['strike']
-                k_dte = max(row['dte'], 0.5)
-                k_iv = row['iv'] if row['iv'] > 0 else 0.20
-                k_type = str(row['type']).upper()
-                
-                if spot <= 0 or k_strike <= 0:
-                    gammas.append(0.0)
-                    deltas.append(0.0)
-                    continue
-                    
-                T = k_dte / 365.0
-                try:
-                    d1 = (math.log(spot / k_strike) + (r + 0.5 * k_iv ** 2) * T) / (k_iv * math.sqrt(T))
-                    pdf = math.exp(-0.5 * d1**2) / math.sqrt(2.0 * math.pi)
-                    gamma = pdf / (spot * k_iv * math.sqrt(T))
-                    cdf = 0.5 * (1.0 + math.erf(d1 / math.sqrt(2.0)))
-                    delta = cdf if k_type in ['C', 'CALL'] else (cdf - 1.0)
-                    gammas.append(gamma)
-                    deltas.append(delta)
-                except Exception:
-                    gammas.append(0.0)
-                    deltas.append(0.0)
-                    
-            df_raw['gamma'] = gammas
-            df_raw['delta'] = deltas
+            if 'iv' in df_raw.columns and 'implied_volatility' not in df_raw.columns:
+                iv_col = pd.to_numeric(df_raw['iv'], errors='coerce').fillna(0.0)
+                df_raw['implied_volatility'] = iv_col.apply(lambda v: v / 100.0 if v > 3.0 else v)
+            elif 'implied_volatility' in df_raw.columns:
+                iv_col = pd.to_numeric(df_raw['implied_volatility'], errors='coerce').fillna(0.0)
+                df_raw['implied_volatility'] = iv_col.apply(lambda v: v / 100.0 if v > 3.0 else v)
+            else:
+                df_raw['implied_volatility'] = 0.20
     except Exception as e:
         print(f"Error fetching option_quote: {e}")
         
@@ -192,6 +151,10 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
                 df_raw['open_interest'] = df_yf_raw['openInterest'].fillna(0.0).astype(float)
                 df_raw['volume'] = df_yf_raw['volume'].fillna(0.0).astype(float)
                 df_raw['implied_volatility'] = df_yf_raw['impliedVolatility'].fillna(0.0).astype(float)
+                if 'lastPrice' in df_yf_raw.columns:
+                    df_raw['opt_price'] = pd.to_numeric(df_yf_raw['lastPrice'], errors='coerce').fillna(0.0)
+                else:
+                    df_raw['opt_price'] = 0.0
                 
                 today = datetime.date.today()
                 df_raw['dte'] = df_raw['expiry'].apply(
@@ -239,13 +202,13 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
         
     # Calcular exposiciones locales según el modo
     if mode == "Acciones":
-        # MODO ACCIONES: Exposición en acciones (100 acciones por contrato)
-        df_raw['call_gex'] = df_raw.apply(lambda r: r['open_interest'] * 100.0 * r['gamma'] * spot if r['type'] == 'C' else 0.0, axis=1)
-        df_raw['put_gex'] = df_raw.apply(lambda r: -r['open_interest'] * 100.0 * r['gamma'] * spot if r['type'] == 'P' else 0.0, axis=1)
+        # MODO ACCIONES: Exposición en acciones (sin el 100x y multiplicado por spot lineal)
+        df_raw['call_gex'] = df_raw.apply(lambda r: r['open_interest'] * r['gamma'] * spot if r['type'] == 'C' else 0.0, axis=1)
+        df_raw['put_gex'] = df_raw.apply(lambda r: -r['open_interest'] * r['gamma'] * spot if r['type'] == 'P' else 0.0, axis=1)
         df_raw['net_gex'] = df_raw['call_gex'] + df_raw['put_gex']
         
-        df_raw['call_dex'] = df_raw.apply(lambda r: r['open_interest'] * 100.0 * r['delta'] if r['type'] == 'C' else 0.0, axis=1)
-        df_raw['put_dex'] = df_raw.apply(lambda r: r['open_interest'] * 100.0 * r['delta'] if r['type'] == 'P' else 0.0, axis=1)
+        df_raw['call_dex'] = df_raw.apply(lambda r: r['open_interest'] * r['delta'] * spot if r['type'] == 'C' else 0.0, axis=1)
+        df_raw['put_dex'] = df_raw.apply(lambda r: r['open_interest'] * r['delta'] * spot if r['type'] == 'P' else 0.0, axis=1)
         df_raw['net_dex'] = df_raw['call_dex'] + df_raw['put_dex']
     else:
         # MODO USD: Fórmula oficial en USD (con spot*spot para GEX y delta*spot*100 para DEX)
@@ -263,6 +226,45 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
     df_raw['call_volume'] = df_raw.apply(lambda r: r['volume'] if r['type'] == 'C' else 0.0, axis=1)
     df_raw['put_volume'] = df_raw.apply(lambda r: r['volume'] if r['type'] == 'P' else 0.0, axis=1)
     
+    # Calcular prima teórica (Black-Scholes) cuando opt_price no venga en la respuesta
+    import math
+    if 'opt_price' not in df_raw.columns:
+        df_raw['opt_price'] = 0.0
+    if 'implied_volatility' not in df_raw.columns:
+        df_raw['implied_volatility'] = 0.20
+        
+    def calc_opt_price(r):
+        p = float(r.get('opt_price', 0.0) or 0.0)
+        if p > 0:
+            return p
+        k = float(r.get('strike', 0.0) or 0.0)
+        dte = max(float(r.get('dte', 0.0) or 0.0), 0.5)
+        iv = float(r.get('implied_volatility', 0.20) or 0.20)
+        if iv <= 0:
+            iv = 0.20
+        if spot <= 0 or k <= 0:
+            return 0.0
+        T = dte / 365.0
+        rate = 0.045
+        try:
+            d1 = (math.log(spot / k) + (rate + 0.5 * iv * iv) * T) / (iv * math.sqrt(T))
+            d2 = d1 - iv * math.sqrt(T)
+            n_d1 = 0.5 * (1.0 + math.erf(d1 / math.sqrt(2.0)))
+            n_d2 = 0.5 * (1.0 + math.erf(d2 / math.sqrt(2.0)))
+            if r.get('type') == 'C':
+                val = spot * n_d1 - k * math.exp(-rate * T) * n_d2
+            else:
+                val = k * math.exp(-rate * T) * (1.0 - n_d2) - spot * (1.0 - n_d1)
+            return max(val, 0.01)
+        except Exception:
+            return max(spot - k, 0.01) if r.get('type') == 'C' else max(k - spot, 0.01)
+
+    df_raw['opt_price'] = df_raw.apply(calc_opt_price, axis=1)
+    df_raw['call_prem_vol'] = df_raw['call_volume'] * df_raw['opt_price'] * 100.0
+    df_raw['put_prem_vol'] = df_raw['put_volume'] * df_raw['opt_price'] * 100.0
+    df_raw['call_prem_oi'] = df_raw['call_oi'] * df_raw['opt_price'] * 100.0
+    df_raw['put_prem_oi'] = df_raw['put_oi'] * df_raw['opt_price'] * 100.0
+    
     # Agrupar por strike
     df_gex = df_raw.groupby('strike').agg({
         'call_gex': 'sum',
@@ -273,7 +275,11 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
         'open_interest': 'sum',
         'volume': 'sum',
         'call_volume': 'sum',
-        'put_volume': 'sum'
+        'put_volume': 'sum',
+        'call_prem_vol': 'sum',
+        'put_prem_vol': 'sum',
+        'call_prem_oi': 'sum',
+        'put_prem_oi': 'sum'
     }).reset_index()
     
     df_dex = df_raw.groupby('strike').agg({
@@ -360,3 +366,70 @@ def calculate_levels(df_gex, df_dex, spot):
         "Total Net GEX": net_gex,
         "Total Net DEX": net_dex
     }
+
+
+def _flashalpha_get(path, api_key, timeout=10):
+    """Realiza una petición GET autenticada a FlashAlpha Lab API."""
+    import json
+    import urllib.request
+
+    url = f"https://lab.flashalpha.com{path}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "X-Api-Key": api_key,
+            "Accept": "application/json",
+            "User-Agent": "GammaScannerOptions/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def fetch_live_flow(ticker, api_key):
+    """
+    Consulta los endpoints de Flujo en Vivo de FlashAlpha:
+    - /v1/flow/summary/{symbol}
+    - /v1/flow/gex/{symbol}
+    - /v1/flow/levels/{symbol}
+    """
+    ticker = ticker.upper().strip()
+    result = {
+        "summary": {},
+        "gex": {},
+        "levels": {},
+        "strikes_df": pd.DataFrame(),
+        "error": None,
+    }
+    if not api_key or not ticker:
+        result["error"] = "Falta API Key o Ticker."
+        return result
+
+    try:
+        result["summary"] = _flashalpha_get(f"/v1/flow/summary/{ticker}", api_key)
+    except Exception as e:
+        result["error"] = f"Error en Flow Summary: {e}"
+
+    try:
+        gex_data = _flashalpha_get(f"/v1/flow/gex/{ticker}", api_key)
+        result["gex"] = gex_data
+        strikes = gex_data.get("strikes", []) if isinstance(gex_data, dict) else []
+        if strikes:
+            df_s = pd.DataFrame(strikes)
+            for col in ["strike", "call_gex", "put_gex", "net_gex", "call_oi", "put_oi", "call_volume", "put_volume"]:
+                if col in df_s.columns:
+                    df_s[col] = pd.to_numeric(df_s[col], errors="coerce").fillna(0.0)
+                else:
+                    df_s[col] = 0.0
+            df_s["total_volume"] = df_s["call_volume"] + df_s["put_volume"]
+            result["strikes_df"] = df_s
+    except Exception as e:
+        err_msg = f"Error en Flow GEX: {e}"
+        result["error"] = f"{result['error']} | {err_msg}" if result["error"] else err_msg
+
+    try:
+        result["levels"] = _flashalpha_get(f"/v1/flow/levels/{ticker}", api_key)
+    except Exception:
+        pass
+
+    return result
