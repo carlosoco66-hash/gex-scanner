@@ -2,16 +2,50 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import time
+import importlib
 import plotly.graph_objects as go
 import streamlit.components.v1 as components
-from gex_engine import (
-    get_live_spot_price,
-    get_options_expirations,
-    fetch_and_calculate_all,
-    calculate_levels,
-    fetch_live_flow,
-    calculate_tactical_metrics
+import gex_engine
+
+# Forzar recarga en caliente de gex_engine para que Streamlit Cloud detecte funciones nuevas sin reiniciar contenedor
+importlib.reload(gex_engine)
+
+get_live_spot_price = gex_engine.get_live_spot_price
+get_options_expirations = gex_engine.get_options_expirations
+fetch_and_calculate_all = gex_engine.fetch_and_calculate_all
+calculate_levels = gex_engine.calculate_levels
+fetch_live_flow = getattr(
+    gex_engine,
+    "fetch_live_flow",
+    lambda ticker, api_key: {"summary": {}, "gex": {}, "levels": {}, "strikes_df": pd.DataFrame(), "error": "Actualiza gex_engine.py en GitHub"},
 )
+
+
+def _fallback_tactical_metrics(df_gex, df_raw, spot, live_flow=None):
+    return {
+        "net_vex": float(df_gex["net_vex"].sum()) if "net_vex" in df_gex.columns else 0.0,
+        "net_chex": float(df_gex["net_chex"].sum()) if "net_chex" in df_gex.columns else 0.0,
+        "atm_iv": 0.35,
+        "em_1d": spot * 0.35 * (1.0 / 252.0) ** 0.5,
+        "em_1d_pct": 0.35 * ((1.0 / 252.0) ** 0.5) * 100.0,
+        "em_low_1d": spot * (1.0 - 0.35 * (1.0 / 252.0) ** 0.5),
+        "em_high_1d": spot * (1.0 + 0.35 * (1.0 / 252.0) ** 0.5),
+        "em_exp": spot * 0.35 * (7.0 / 365.0) ** 0.5,
+        "em_exp_pct": 0.35 * ((7.0 / 365.0) ** 0.5) * 100.0,
+        "min_dte": 7,
+        "pin_strike": spot,
+        "pin_score": 50.0,
+        "pin_label": "MEDIO",
+        "call_wall": float(df_gex.loc[df_gex["call_gex"].idxmax()]["strike"]) if ("call_gex" in df_gex.columns and not df_gex.empty) else spot,
+        "put_wall": float(df_gex.loc[df_gex["put_gex"].idxmin()]["strike"]) if ("put_gex" in df_gex.columns and not df_gex.empty) else spot,
+        "pin_df": pd.DataFrame(),
+        "radar_df": pd.DataFrame(),
+        "total_call_prem_vol": 0.0,
+        "total_put_prem_vol": 0.0,
+    }
+
+
+calculate_tactical_metrics = getattr(gex_engine, "calculate_tactical_metrics", _fallback_tactical_metrics)
 
 # Funciones con caché para optimizar consultas de la API
 @st.cache_data(ttl=300)
@@ -853,9 +887,10 @@ if st.session_state.expirations:
             with tab_vex:
                 df_vp = df_gex[(df_gex["strike"] >= spot_now * (1 - rango_pct / 100.0)) & (df_gex["strike"] <= spot_now * (1 + rango_pct / 100.0))].copy()
                 fig_vex = go.Figure()
-                fig_vex.add_trace(go.Bar(x=df_vp["strike"], y=df_vp["call_vex"], name="VEX Calls (Arriba)", marker_color="#2ecc71", opacity=0.85))
-                fig_vex.add_trace(go.Bar(x=df_vp["strike"], y=df_vp["put_vex"], name="VEX Puts (Abajo)", marker_color="#348feb", opacity=0.85))
-                fig_vex.add_trace(go.Scatter(x=df_vp["strike"], y=df_vp["net_vex"], mode="lines+markers", line=dict(color="#ffcc00", width=2), name="VEX Neto"))
+                if "call_vex" in df_vp.columns:
+                    fig_vex.add_trace(go.Bar(x=df_vp["strike"], y=df_vp["call_vex"], name="VEX Calls (Arriba)", marker_color="#2ecc71", opacity=0.85))
+                    fig_vex.add_trace(go.Bar(x=df_vp["strike"], y=df_vp["put_vex"], name="VEX Puts (Abajo)", marker_color="#348feb", opacity=0.85))
+                    fig_vex.add_trace(go.Scatter(x=df_vp["strike"], y=df_vp["net_vex"], mode="lines+markers", line=dict(color="#ffcc00", width=2), name="VEX Neto"))
                 fig_vex.add_vline(x=spot_now, line_dash="dash", line_color="#ffcc00", line_width=2, annotation_text=f"Spot: ${spot_now:.2f}", annotation_position="top right")
                 fig_vex.update_layout(
                     title=f"Vanna Exposure (VEX) por Strike — Impacto por cada 1% de cambio en IV ({engine_mode})",
@@ -874,9 +909,10 @@ if st.session_state.expirations:
             with tab_chex:
                 df_cp = df_gex[(df_gex["strike"] >= spot_now * (1 - rango_pct / 100.0)) & (df_gex["strike"] <= spot_now * (1 + rango_pct / 100.0))].copy()
                 fig_chex = go.Figure()
-                fig_chex.add_trace(go.Bar(x=df_cp["strike"], y=df_cp["call_chex"], name="CHEX Calls (Arriba)", marker_color="#a371f7", opacity=0.85))
-                fig_chex.add_trace(go.Bar(x=df_cp["strike"], y=df_cp["put_chex"], name="CHEX Puts (Abajo)", marker_color="#348feb", opacity=0.85))
-                fig_chex.add_trace(go.Scatter(x=df_cp["strike"], y=df_cp["net_chex"], mode="lines+markers", line=dict(color="#ff003c", width=2), name="CHEX Neto"))
+                if "call_chex" in df_cp.columns:
+                    fig_chex.add_trace(go.Bar(x=df_cp["strike"], y=df_cp["call_chex"], name="CHEX Calls (Arriba)", marker_color="#a371f7", opacity=0.85))
+                    fig_chex.add_trace(go.Bar(x=df_cp["strike"], y=df_cp["put_chex"], name="CHEX Puts (Abajo)", marker_color="#348feb", opacity=0.85))
+                    fig_chex.add_trace(go.Scatter(x=df_cp["strike"], y=df_cp["net_chex"], mode="lines+markers", line=dict(color="#ff003c", width=2), name="CHEX Neto"))
                 fig_chex.add_vline(x=spot_now, line_dash="dash", line_color="#ffcc00", line_width=2, annotation_text=f"Spot: ${spot_now:.2f}", annotation_position="top right")
                 fig_chex.update_layout(
                     title=f"Charm Exposure (CHEX) por Strike — Flujo diario por paso del tiempo ({engine_mode})",
