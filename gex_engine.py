@@ -3,6 +3,79 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import datetime
+import math
+
+
+def _norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _inv_norm_cdf(p):
+    """Aproximación de Acklam para inversa de la normal estándar (0 < p < 1)."""
+    if p <= 0.0 or p >= 1.0:
+        return 0.0
+    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
+    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+         6.680131188771972e+01, -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
+    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+         3.754408661907416e+00]
+    plow = 0.02425
+    phigh = 1.0 - plow
+    if p < plow:
+        q = math.sqrt(-2.0 * math.log(p))
+        return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1.0)
+    if p <= phigh:
+        q = p - 0.5
+        r = q * q
+        return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q / (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1.0)
+    q = math.sqrt(-2.0 * math.log(1.0 - p))
+    return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1.0)
+
+
+def _solve_iv_from_price(price, spot, strike, T, opt_type, rate=0.045):
+    """Resuelve la IV real por bisección de Black-Scholes desde el precio en vivo de la opción."""
+    if price <= 0.005 or spot <= 0 or strike <= 0 or T <= 0:
+        return 0.0
+    disc_k = strike * math.exp(-rate * T)
+    intrinsic = max(spot - disc_k, 0.0) if opt_type == 'C' else max(disc_k - spot, 0.0)
+    if price <= intrinsic + 0.005:
+        return 0.0
+
+    lo, hi = 0.02, 3.50
+    sqrt_T = math.sqrt(T)
+    for _ in range(28):
+        mid = 0.5 * (lo + hi)
+        d1 = (math.log(spot / strike) + (rate + 0.5 * mid * mid) * T) / (mid * sqrt_T)
+        d2 = d1 - mid * sqrt_T
+        if opt_type == 'C':
+            bs_val = spot * _norm_cdf(d1) - disc_k * _norm_cdf(d2)
+        else:
+            bs_val = disc_k * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
+        if bs_val > price:
+            hi = mid
+        else:
+            lo = mid
+    iv_res = 0.5 * (lo + hi)
+    return iv_res if 0.025 < iv_res < 3.45 else 0.0
+
+
+def _solve_iv_from_greeks(gamma, delta, spot, T, opt_type):
+    """Estima IV real invirtiendo Gamma y Delta en vivo de Black-Scholes."""
+    if gamma <= 1e-6 or spot <= 0 or T <= 0:
+        return 0.0
+    c_delta = delta if opt_type == 'C' else (delta + 1.0)
+    if c_delta <= 0.12 or c_delta >= 0.88:
+        return 0.0
+    try:
+        d1 = _inv_norm_cdf(c_delta)
+        pdf_d1 = math.exp(-0.5 * d1 * d1) / math.sqrt(2.0 * math.pi)
+        iv_est = pdf_d1 / (spot * gamma * math.sqrt(T))
+        return iv_est if 0.04 <= iv_est <= 3.0 else 0.0
+    except Exception:
+        return 0.0
 
 def get_live_spot_price(ticker):
     """Obtiene el precio spot en tiempo real usando yfinance."""
@@ -95,9 +168,11 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
             df_raw['open_interest'] = df_raw['open_interest'].fillna(0.0).astype(float)
             df_raw['volume'] = df_raw['volume'].fillna(0.0).astype(float)
             
-            # Extraer precio de la opción si viene en FlashAlpha (mid, last, mark, price o promedio bid/ask)
+            # Extraer precio de la opción si viene en FlashAlpha (mid, mark, last, price o promedio bid/ask)
             if 'mid' in df_raw.columns:
                 df_raw['opt_price'] = pd.to_numeric(df_raw['mid'], errors='coerce').fillna(0.0)
+            elif 'mark' in df_raw.columns:
+                df_raw['opt_price'] = pd.to_numeric(df_raw['mark'], errors='coerce').fillna(0.0)
             elif 'last' in df_raw.columns:
                 df_raw['opt_price'] = pd.to_numeric(df_raw['last'], errors='coerce').fillna(0.0)
             elif 'price' in df_raw.columns:
@@ -108,15 +183,69 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
                 df_raw['opt_price'] = (b + a) / 2.0
             else:
                 df_raw['opt_price'] = 0.0
-                
-            if 'iv' in df_raw.columns and 'implied_volatility' not in df_raw.columns:
-                iv_col = pd.to_numeric(df_raw['iv'], errors='coerce').fillna(0.0)
-                df_raw['implied_volatility'] = iv_col.apply(lambda v: v / 100.0 if v > 3.0 else v)
-            elif 'implied_volatility' in df_raw.columns:
-                iv_col = pd.to_numeric(df_raw['implied_volatility'], errors='coerce').fillna(0.0)
-                df_raw['implied_volatility'] = iv_col.apply(lambda v: v / 100.0 if v > 3.0 else v)
-            else:
-                df_raw['implied_volatility'] = 0.20
+
+            # 1) Buscar IV directa en cualquiera de los campos que pueda devolver FlashAlpha
+            iv_found = False
+            for iv_key in ('iv', 'implied_volatility', 'impliedVolatility', 'mid_iv', 'mark_iv', 'volatility', 'imp_vol', 'theo_iv'):
+                if iv_key in df_raw.columns:
+                    iv_col = pd.to_numeric(df_raw[iv_key], errors='coerce').fillna(0.0)
+                    iv_norm = iv_col.apply(lambda v: v / 100.0 if v > 3.0 else v)
+                    if (iv_norm > 0.01).any():
+                        df_raw['implied_volatility'] = iv_norm
+                        iv_found = True
+                        break
+
+            # 2) Si FlashAlpha no trajo IV directa, calcular IV real en vivo desde opt_price o gamma/delta
+            if not iv_found:
+                inferred_ivs = []
+                for _, r in df_raw.iterrows():
+                    k_val = float(r.get('strike', 0.0) or 0.0)
+                    dte_val = float(r.get('dte', 0.0) or 0.0)
+                    T_iv = max(dte_val, 0.25) / 365.0
+                    opt_t = r.get('type', 'C')
+                    p_val = float(r.get('opt_price', 0.0) or 0.0)
+                    iv_calc = 0.0
+                    if spot > 0 and k_val > 0 and abs(k_val - spot) / spot <= 0.25:
+                        if p_val > 0:
+                            iv_calc = _solve_iv_from_price(p_val, spot, k_val, T_iv, opt_t)
+                        if iv_calc <= 0:
+                            g_val = float(r.get('gamma', 0.0) or 0.0)
+                            d_val = float(r.get('delta', 0.0) or 0.0)
+                            iv_calc = _solve_iv_from_greeks(g_val, d_val, spot, T_iv, opt_t)
+                    inferred_ivs.append(iv_calc)
+                df_raw['implied_volatility'] = inferred_ivs
+
+                # Completar filas sin IV válida con la mediana ATM de su vencimiento (o global)
+                valid_mask = (df_raw['implied_volatility'] > 0.02) & (df_raw['implied_volatility'] < 3.5)
+                if valid_mask.any():
+                    df_valid = df_raw[valid_mask].copy()
+                    df_valid['dist_s'] = (df_valid['strike'] - spot).abs()
+                    exp_meds = {}
+                    for exp_k, grp in df_valid.groupby('expiry'):
+                        exp_meds[exp_k] = float(grp.nsmallest(6, 'dist_s')['implied_volatility'].median())
+                    global_med = float(df_valid.nsmallest(8, 'dist_s')['implied_volatility'].median())
+                    df_raw['implied_volatility'] = df_raw.apply(
+                        lambda r: r['implied_volatility']
+                        if 0.02 < float(r['implied_volatility']) < 3.5
+                        else exp_meds.get(r['expiry'], global_med),
+                        axis=1,
+                    )
+                else:
+                    # 3) Respaldo ligero a yfinance solo para obtener IV real si no hubo precio ni gamma válida
+                    yf_iv_med = 0.0
+                    try:
+                        t_yf = yf.Ticker(ticker.upper())
+                        exps_avail = selected_expirations if selected_expirations else list(t_yf.options[:1])
+                        if exps_avail:
+                            ch = t_yf.option_chain(exps_avail[0])
+                            df_ch = pd.concat([ch.calls, ch.puts], ignore_index=True)
+                            df_ch = df_ch[(df_ch['impliedVolatility'] > 0.02) & (df_ch['impliedVolatility'] < 3.5)].copy()
+                            if not df_ch.empty:
+                                df_ch['dist_s'] = (df_ch['strike'] - spot).abs()
+                                yf_iv_med = float(df_ch.nsmallest(6, 'dist_s')['impliedVolatility'].median())
+                    except Exception:
+                        pass
+                    df_raw['implied_volatility'] = yf_iv_med if yf_iv_med > 0.02 else 0.20
     except Exception as e:
         print(f"Error fetching option_quote: {e}")
         

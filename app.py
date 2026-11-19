@@ -2,7 +2,18 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+try:
+    from zoneinfo import ZoneInfo
+    CA_TZ = ZoneInfo("America/Los_Angeles")
+except Exception:
+    CA_TZ = timezone(timedelta(hours=-8))
+
+
+def now_ca_str():
+    return datetime.now(CA_TZ).strftime("%H:%M:%S")
+
+
 import importlib
 import plotly.graph_objects as go
 import streamlit.components.v1 as components
@@ -484,12 +495,12 @@ if st.session_state.expirations:
                     st.session_state.results_ticker = ticker
                     st.session_state.results_mode = engine_mode
                     st.session_state.results_exps = exp_key
-                    st.session_state.last_updated_str = datetime.now().strftime("%H:%M:%S")
+                    st.session_state.last_updated_str = now_ca_str()
 
         last_ts = st.session_state.get("last_updated_str")
         if last_ts:
             ts_placeholder.markdown(
-                f"<div style='padding-top:8px;color:#8b949e;font-size:13px;'>🕒 Última actualización: <b style='color:#c9d1d9;'>{last_ts}</b> (caché 60s)</div>",
+                f"<div style='padding-top:8px;color:#8b949e;font-size:13px;'>🕒 Última actualización: <b style='color:#c9d1d9;'>{last_ts} PT</b> (California · caché 60s)</div>",
                 unsafe_allow_html=True,
             )
 
@@ -810,7 +821,7 @@ if st.session_state.expirations:
             if "iv_history_map" not in st.session_state:
                 st.session_state.iv_history_map = {}
             iv_hist = st.session_state.iv_history_map.get(iv_hist_key, [])
-            cur_ts_lbl = st.session_state.get("last_updated_str") or datetime.now().strftime("%H:%M:%S")
+            cur_ts_lbl = st.session_state.get("last_updated_str") or now_ca_str()
             if not iv_hist or iv_hist[-1]["ts"] != cur_ts_lbl:
                 iv_hist.append({"ts": cur_ts_lbl, "iv": round(atm_iv_pct, 2)})
                 iv_hist = iv_hist[-20:]
