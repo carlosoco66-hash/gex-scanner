@@ -369,21 +369,36 @@ def calculate_levels(df_gex, df_dex, spot):
 
 
 def _flashalpha_get(path, api_key, timeout=10):
-    """Realiza una petición GET autenticada a FlashAlpha Lab API."""
+    """Realiza una petición GET autenticada a FlashAlpha API."""
     import json
+    import urllib.error
     import urllib.request
 
-    url = f"https://lab.flashalpha.com{path}"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "X-Api-Key": api_key,
-            "Accept": "application/json",
-            "User-Agent": "GammaScannerOptions/1.0",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    last_err = None
+    for base_url in ("https://lab.flashalpha.com", "https://api.flashalpha.com"):
+        url = f"{base_url}{path}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "X-Api-Key": api_key.strip(),
+                "Accept": "application/json",
+                "User-Agent": "python-requests/2.31.0",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", errors="ignore")[:200]
+            except Exception:
+                body = ""
+            last_err = f"HTTP {e.code} ({base_url}): {body or e.reason}"
+            if e.code < 500:
+                raise RuntimeError(last_err)
+        except Exception as e:
+            last_err = str(e)
+    raise RuntimeError(last_err or "Error desconocido en FlashAlpha API")
 
 
 def fetch_live_flow(ticker, api_key):

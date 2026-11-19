@@ -616,49 +616,37 @@ if st.session_state.expirations:
                     strike_bg = "#4d3b08" if is_atm else "#08090c"
                     strike_color = "#ffd700" if is_atm else "#e6edf3"
 
-                    rows_html += f"""
-                    <tr style="{row_border}">
-                        <td style="background-color: rgb({p_r},{p_g},{p_b}); color: #ffffff; text-align: center; padding: 10px 12px; font-family: 'Courier New', monospace; font-weight: 700; font-size: 15px; width: 40%;">
-                            ${p_val:,.0f}
-                        </td>
-                        <td style="background-color: {strike_bg}; color: {strike_color}; text-align: center; padding: 10px 12px; font-family: 'Courier New', monospace; font-weight: 800; font-size: 15px; width: 20%;">
-                            {s_str}
-                        </td>
-                        <td style="background-color: rgb({c_r},{c_g},{c_b}); color: #06150a; text-align: center; padding: 10px 12px; font-family: 'Courier New', monospace; font-weight: 800; font-size: 15px; width: 40%;">
-                            ${c_val:,.0f}
-                        </td>
-                    </tr>
-                    """
+                    rows_html += (
+                        f'<tr style="{row_border}">'
+                        f'<td style="background-color: rgb({p_r},{p_g},{p_b}); color: #ffffff; text-align: center; padding: 10px 12px; font-family: \'Courier New\', monospace; font-weight: 700; font-size: 15px; width: 40%;">${p_val:,.0f}</td>'
+                        f'<td style="background-color: {strike_bg}; color: {strike_color}; text-align: center; padding: 10px 12px; font-family: \'Courier New\', monospace; font-weight: 800; font-size: 15px; width: 20%;">{s_str}</td>'
+                        f'<td style="background-color: rgb({c_r},{c_g},{c_b}); color: #06150a; text-align: center; padding: 10px 12px; font-family: \'Courier New\', monospace; font-weight: 800; font-size: 15px; width: 40%;">${c_val:,.0f}</td>'
+                        f'</tr>'
+                    )
 
-                pf_html = f"""
-                <div style="border: 1.5px solid #d4a017; border-radius: 10px; background-color: #08090c; padding: 16px 20px; margin-bottom: 25px; box-shadow: 0 4px 20px rgba(0,0,0,0.6);">
-                    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 6px;">
-                        <div style="display: flex; align-items: center; gap: 12px;">
-                            <span style="color: #f5b700; font-family: 'Courier New', monospace; font-size: 20px; font-weight: 800; letter-spacing: 0.5px;">Premium Flow</span>
-                            <span style="background-color: #161922; border: 1px solid #3a3f50; color: #d0d7de; padding: 2px 10px; border-radius: 12px; font-family: monospace; font-size: 13px;">{exp_badge_txt}</span>
-                        </div>
-                        <div style="font-family: 'Courier New', monospace; font-size: 16px; font-weight: 700;">
-                            <span style="color: #c9d1d9;">Put: </span><span style="color: #ff4d4d; margin-right: 16px;">${total_put_prem:,.0f}</span>
-                            <span style="color: #c9d1d9;">Call: </span><span style="color: #2ecc71;">${total_call_prem:,.0f}</span>
-                        </div>
-                    </div>
-                    <div style="color: #8b949e; font-family: 'Courier New', monospace; font-size: 13px; margin-bottom: 14px;">
-                        Spot: {res['Spot Price']:.2f} (ATM strike highlight: {atm_strike:g})
-                    </div>
-                    <table style="width: 100%; border-collapse: collapse; overflow: hidden; border-radius: 6px;">
-                        <thead>
-                            <tr style="border-bottom: 1px solid #262936;">
-                                <th style="color: #d4a017; text-align: center; padding: 8px; font-family: 'Courier New', monospace; font-size: 13px; letter-spacing: 1px;">PUTS</th>
-                                <th style="color: #d4a017; text-align: center; padding: 8px; font-family: 'Courier New', monospace; font-size: 13px; letter-spacing: 1px;">STRIKE</th>
-                                <th style="color: #d4a017; text-align: center; padding: 8px; font-family: 'Courier New', monospace; font-size: 13px; letter-spacing: 1px;">CALLS</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {rows_html}
-                        </tbody>
-                    </table>
-                </div>
-                """
+                pf_html = (
+                    '<div style="border: 1.5px solid #d4a017; border-radius: 10px; background-color: #08090c; padding: 16px 20px; margin-bottom: 25px; box-shadow: 0 4px 20px rgba(0,0,0,0.6);">'
+                    '<div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 6px;">'
+                    '<div style="display: flex; align-items: center; gap: 12px;">'
+                    '<span style="color: #f5b700; font-family: \'Courier New\', monospace; font-size: 20px; font-weight: 800; letter-spacing: 0.5px;">Premium Flow</span>'
+                    f'<span style="background-color: #161922; border: 1px solid #3a3f50; color: #d0d7de; padding: 2px 10px; border-radius: 12px; font-family: monospace; font-size: 13px;">{exp_badge_txt}</span>'
+                    '</div>'
+                    '<div style="font-family: \'Courier New\', monospace; font-size: 16px; font-weight: 700;">'
+                    f'<span style="color: #c9d1d9;">Put: </span><span style="color: #ff4d4d; margin-right: 16px;">${total_put_prem:,.0f}</span>'
+                    f'<span style="color: #c9d1d9;">Call: </span><span style="color: #2ecc71;">${total_call_prem:,.0f}</span>'
+                    '</div>'
+                    '</div>'
+                    f'<div style="color: #8b949e; font-family: \'Courier New\', monospace; font-size: 13px; margin-bottom: 14px;">Spot: {res["Spot Price"]:.2f} (ATM strike highlight: {atm_strike:g})</div>'
+                    '<table style="width: 100%; border-collapse: collapse; overflow: hidden; border-radius: 6px;">'
+                    '<thead><tr style="border-bottom: 1px solid #262936;">'
+                    '<th style="color: #d4a017; text-align: center; padding: 8px; font-family: \'Courier New\', monospace; font-size: 13px; letter-spacing: 1px;">PUTS</th>'
+                    '<th style="color: #d4a017; text-align: center; padding: 8px; font-family: \'Courier New\', monospace; font-size: 13px; letter-spacing: 1px;">STRIKE</th>'
+                    '<th style="color: #d4a017; text-align: center; padding: 8px; font-family: \'Courier New\', monospace; font-size: 13px; letter-spacing: 1px;">CALLS</th>'
+                    '</tr></thead>'
+                    f'<tbody>{rows_html}</tbody>'
+                    '</table>'
+                    '</div>'
+                )
                 st.markdown(pf_html, unsafe_allow_html=True)
 
             # Fila 4.75: Panel FLUJO EN VIVO (FlashAlpha Live Flow)
