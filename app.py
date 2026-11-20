@@ -815,19 +815,23 @@ if st.session_state.expirations:
             em_low = tac["em_low_1d"]
             em_high = tac["em_high_1d"]
             atm_iv_pct = tac["atm_iv"] * 100.0
+            spot_now = res["Spot Price"]
+            tot_gex_now = res["Total Net GEX"]
+            f_dir_now = str(lf_summary.get("flow_direction", "no_flow")).lower()
 
-            # Rastreador de tendencia de IV ATM en vivo (por ticker y vencimientos en la sesión)
+            # Rastreador de tendencia de IV ATM y Spot en vivo (por ticker y vencimientos en la sesión)
             iv_hist_key = f"{ticker}|{'_'.join(map(str, selected_expirations))}"
             if "iv_history_map" not in st.session_state:
                 st.session_state.iv_history_map = {}
             iv_hist = st.session_state.iv_history_map.get(iv_hist_key, [])
             cur_ts_lbl = st.session_state.get("last_updated_str") or now_ca_str()
             if not iv_hist or iv_hist[-1]["ts"] != cur_ts_lbl:
-                iv_hist.append({"ts": cur_ts_lbl, "iv": round(atm_iv_pct, 2)})
+                iv_hist.append({"ts": cur_ts_lbl, "iv": round(atm_iv_pct, 2), "spot": round(spot_now, 4)})
                 iv_hist = iv_hist[-20:]
                 st.session_state.iv_history_map[iv_hist_key] = iv_hist
 
             iv_base = iv_hist[0]["iv"]
+            spot_base = float(iv_hist[0].get("spot", spot_now) or spot_now)
             if len(iv_hist) >= 2:
                 iv_prev = iv_hist[-2]["iv"]
                 iv_diff_prev = atm_iv_pct - iv_prev
@@ -849,12 +853,25 @@ if st.session_state.expirations:
                     iv_badge_fg = "#8b949e"
                     iv_badge_bg = "rgba(139,148,158,0.18)"
                 iv_meta_extra = f" · Base: <b>{iv_base:.1f}%</b>"
+
+                spot_prev = float(iv_hist[-2].get("spot", spot_now) or spot_now)
+                spot_pct_prev = ((spot_now - spot_prev) / spot_prev * 100.0) if spot_prev > 0 else 0.0
+                spot_pct_base = ((spot_now - spot_base) / spot_base * 100.0) if spot_base > 0 else 0.0
+                spot_ref_pct = spot_pct_prev if abs(spot_pct_prev) >= 0.08 else spot_pct_base
+                if spot_ref_pct >= 0.08:
+                    spot_state = "up"
+                elif spot_ref_pct <= -0.08:
+                    spot_state = "down"
+                else:
+                    spot_state = "flat"
             else:
                 iv_state = "base"
                 iv_badge_txt = "● BASE"
                 iv_badge_fg = "#8b949e"
                 iv_badge_bg = "rgba(139,148,158,0.18)"
                 iv_meta_extra = " · Refresca para tendencia"
+                spot_state = "base"
+                spot_ref_pct = 0.0
 
             vex_color = "#2ecc71" if net_vex_val >= 0 else "#ff4d4d"
             vex_border_color = vex_color
@@ -944,10 +961,111 @@ if st.session_state.expirations:
                     unsafe_allow_html=True,
                 )
 
+            # Detector de Squeeze & Confluencias en Vivo (4 condiciones)
+            c_prem_sq = tac["total_call_prem_vol"]
+            p_prem_sq = tac["total_put_prem_vol"]
+            tot_prem_sq = c_prem_sq + p_prem_sq
+            call_share_sq = (c_prem_sq / tot_prem_sq * 100.0) if tot_prem_sq > 0 else 50.0
+            put_share_sq = 100.0 - call_share_sq
+            near_cwall = c_wall > 0 and spot_now >= c_wall * 0.995
+            near_pwall = p_wall > 0 and spot_now <= p_wall * 1.005
+            dist_pin_pct = (abs(spot_now - pin_st) / spot_now * 100.0) if spot_now > 0 else 99.0
+
+            bull_sq_checks = [
+                (spot_state == "up", f"Spot ▲ ({spot_ref_pct:+.2f}%)" if spot_state == "up" else "Spot ▲"),
+                (iv_state == "up", "IV ▲"),
+                (call_share_sq >= 58.0 or f_dir_now == "bullish", f"Calls {call_share_sq:.0f}%"),
+                (tot_gex_now < 0 or near_cwall, "Gamma− / Call Wall"),
+            ]
+            bear_sq_checks = [
+                (spot_state == "down", f"Spot ▼ ({spot_ref_pct:+.2f}%)" if spot_state == "down" else "Spot ▼"),
+                (iv_state == "up", "IV ▲"),
+                (put_share_sq >= 60.0 or f_dir_now == "bearish", f"Puts {put_share_sq:.0f}%"),
+                ((tot_gex_now < 0 and net_vex_val < 0) or (tot_gex_now < 0 and near_pwall), "Gamma− + VEX−"),
+            ]
+            vanna_checks = [
+                (spot_state == "up" or (spot_now >= p_wall and spot_state != "down"), "Spot firme"),
+                (iv_state == "down", "IV ▼"),
+                (net_vex_val > 0 or net_chex_val > 0, "VEX+ / CHEX+"),
+                (tot_gex_now >= 0 or spot_now > p_wall, "Arriba Put Wall"),
+            ]
+            pin_checks = [
+                (dist_pin_pct <= 0.6, f"Cerca Pin ${pin_st:g}"),
+                (pin_sc >= 65.0, f"Pin {pin_sc:.0f}/100"),
+                (iv_state in ("down", "flat"), "IV ▼/●"),
+                ((p_wall <= spot_now <= c_wall) if c_wall > p_wall else (spot_state == "flat"), "En rango"),
+            ]
+
+            bull_sq_n = sum(1 for ok, _ in bull_sq_checks if ok)
+            bear_sq_n = sum(1 for ok, _ in bear_sq_checks if ok)
+            vanna_n = sum(1 for ok, _ in vanna_checks if ok)
+            pin_n = sum(1 for ok, _ in pin_checks if ok)
+
+            if bull_sq_n == 4:
+                sq_title = "🚀 SQUEEZE ALCISTA CONFIRMADO (4/4)"
+                sq_note = "Precio + IV subiendo con flujo agresivo en Calls (FOMO / cobertura alcista)."
+                sq_clr, sq_bg = "#2ecc71", "rgba(46,204,113,0.12)"
+                active_checks = bull_sq_checks
+            elif bear_sq_n == 4:
+                sq_title = "💥 CASCADA BAJISTA ACTIVA (4/4)"
+                sq_note = "Gamma− + VEX− + IV subiendo con Puts dominando (aceleración bajista)."
+                sq_clr, sq_bg = "#ff4d4d", "rgba(255,77,77,0.12)"
+                active_checks = bear_sq_checks
+            elif bull_sq_n == 3 and bull_sq_n >= bear_sq_n:
+                sq_title = "🟡 PRE-ALERTA SQUEEZE ALCISTA (3/4)"
+                sq_note = "Falta 1 condición para confirmar Call Squeeze."
+                sq_clr, sq_bg = "#ffcc00", "rgba(255,204,0,0.10)"
+                active_checks = bull_sq_checks
+            elif bear_sq_n == 3:
+                sq_title = "🟠 ALERTA PRESIÓN BAJISTA (3/4)"
+                sq_note = "Falta 1 condición para activar Cascada Bajista."
+                sq_clr, sq_bg = "#ff8c00", "rgba(255,140,0,0.11)"
+                active_checks = bear_sq_checks
+            elif vanna_n == 4 or (vanna_n == 3 and iv_state == "down"):
+                sq_title = f"🟢 VANNA RALLY / SUBIDA CONTROLADA ({vanna_n}/4)"
+                sq_note = "IV bajando con soporte estructural (empuje alcista ordenado)."
+                sq_clr, sq_bg = "#2ecc71", "rgba(46,204,113,0.10)"
+                active_checks = vanna_checks
+            elif pin_n >= 3 and len(iv_hist) >= 2:
+                sq_title = f"🧲 MODO PIN / COMPRESIÓN ({pin_n}/4)"
+                sq_note = "Precio atrapado cerca del Pin quemando prima (precaución con theta)."
+                sq_clr, sq_bg = "#ffcc00", "rgba(255,204,0,0.10)"
+                active_checks = pin_checks
+            else:
+                if put_share_sq >= call_share_sq:
+                    active_checks = bear_sq_checks
+                    sq_title = f"⚪ SIN SQUEEZE ACTIVO · Radar Bajista ({bear_sq_n}/4)"
+                else:
+                    active_checks = bull_sq_checks
+                    sq_title = f"⚪ SIN SQUEEZE ACTIVO · Radar Alcista ({bull_sq_n}/4)"
+                sq_note = "Refresca en vivo con 🔄 Actualizar En Vivo para evaluar tendencia de Spot e IV." if len(iv_hist) < 2 else "Sin confluencia extrema de squeeze por ahora."
+                sq_clr, sq_bg = "#8b949e", "rgba(139,148,158,0.08)"
+
+            checks_parts = []
+            for ok, lbl in active_checks:
+                bg_c = "rgba(46,204,113,0.14)" if ok else "rgba(139,148,158,0.12)"
+                fg_c = "#e6edf3" if ok else "#8b949e"
+                bd_c = "rgba(46,204,113,0.35)" if ok else "#30363d"
+                fw_c = "600" if ok else "400"
+                ic_c = "✅" if ok else "⬜"
+                checks_parts.append(
+                    f'<span style="background:{bg_c};color:{fg_c};border:1px solid {bd_c};'
+                    f'padding:2px 8px;border-radius:12px;font-size:11.5px;font-weight:{fw_c};">'
+                    f'{ic_c} {lbl}</span>'
+                )
+            checks_html = " ".join(checks_parts)
+
+            st.markdown(
+                f'<div style="background:{sq_bg};border:1px solid {sq_clr};border-left:4px solid {sq_clr};border-radius:8px;padding:10px 16px;margin-top:12px;">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">'
+                f'<div><span style="color:{sq_clr};font-weight:800;font-size:13.5px;">{sq_title}</span>'
+                f'<span style="color:#c9d1d9;font-size:12px;margin-left:10px;">{sq_note}</span></div>'
+                f'<div style="display:flex;flex-wrap:wrap;gap:6px;">{checks_html}</div>'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+
             # Barra de Veredicto Operativo Automático
-            spot_now = res["Spot Price"]
-            tot_gex_now = res["Total Net GEX"]
-            f_dir_now = str(lf_summary.get("flow_direction", "no_flow")).lower()
 
             bull_pts = 0
             bear_pts = 0
