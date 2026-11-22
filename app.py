@@ -1125,19 +1125,20 @@ if st.session_state.expirations:
             # Barra de control de Audio (Silbato Festivo + Sirena + Voz en Español)
             triggered_json = json.dumps(newly_triggered_signals)
             audio_component_html = f"""
-            <div style="background:#11161f;border:1px solid #283040;border-radius:10px;padding:9px 14px;margin-top:12px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;font-family:'Inter',sans-serif;">
+            <style>body {{ margin: 0; padding: 0; background: transparent; }}</style>
+            <div style="background:#11161f;border:1px solid #283040;border-radius:10px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;font-family:'Inter',sans-serif;">
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
                     <span style="color:#e6edf3;font-size:13px;font-weight:700;">🔊 Radar de 4 Señales y Alarmas ({ticker}):</span>
                     <span id="audio_status_badge" style="background:#132a1c;border:1px solid #2ecc71;color:#2ecc71;font-size:11px;font-weight:700;padding:2px 9px;border-radius:999px;">AUDIO + VOZ ACTIVOS</span>
                 </div>
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                    <button onclick="testWhistleAlert()" style="background:#132f20;border:1px solid #2ecc71;color:#7ee787;padding:4px 10px;border-radius:7px;font-size:11.5px;font-weight:700;cursor:pointer;">
+                    <button onclick="testWhistleAlert()" style="background:#132f20;border:1px solid #2ecc71;color:#7ee787;padding:5px 11px;border-radius:7px;font-size:11.5px;font-weight:700;cursor:pointer;">
                         🎉 Probar Silbato + Voz (Subida)
                     </button>
-                    <button onclick="testSirenAlert()" style="background:#341417;border:1px solid #ff4d4d;color:#ff7b72;padding:4px 10px;border-radius:7px;font-size:11.5px;font-weight:700;cursor:pointer;">
+                    <button onclick="testSirenAlert()" style="background:#341417;border:1px solid #ff4d4d;color:#ff7b72;padding:5px 11px;border-radius:7px;font-size:11.5px;font-weight:700;cursor:pointer;">
                         🚨 Probar Sirena + Voz (Caída)
                     </button>
-                    <button id="mute_btn" onclick="toggleMute()" style="background:#1c212b;border:1px solid #3a4252;color:#c9d1d9;padding:4px 10px;border-radius:7px;font-size:11.5px;font-weight:600;cursor:pointer;">
+                    <button id="mute_btn" onclick="toggleMute()" style="background:#1c212b;border:1px solid #3a4252;color:#c9d1d9;padding:5px 11px;border-radius:7px;font-size:11.5px;font-weight:600;cursor:pointer;">
                         🔇 Silenciar
                     </button>
                 </div>
@@ -1329,7 +1330,7 @@ if st.session_state.expirations:
             }})();
             </script>
             """
-            components.html(audio_component_html, height=58, scrolling=False)
+            components.html(audio_component_html, height=88, scrolling=False)
 
             # Renderizar las 4 Opciones Simultáneamente en un Grid 2x2
             sq_col1, sq_col2 = st.columns(2)
