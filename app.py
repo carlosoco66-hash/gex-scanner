@@ -2,9 +2,20 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import time
-import datetime
-import json
+from datetime import datetime, timezone, timedelta
+try:
+    from zoneinfo import ZoneInfo
+    CA_TZ = ZoneInfo("America/Los_Angeles")
+except Exception:
+    CA_TZ = timezone(timedelta(hours=-8))
+
+
+def now_ca_str():
+    return datetime.now(CA_TZ).strftime("%H:%M:%S")
+
+
 import importlib
+import json
 import plotly.graph_objects as go
 import streamlit.components.v1 as components
 import gex_engine
@@ -44,21 +55,17 @@ def _fallback_tactical_metrics(df_gex, df_raw, spot, live_flow=None):
         "radar_df": pd.DataFrame(),
         "total_call_prem_vol": 0.0,
         "total_put_prem_vol": 0.0,
-        "total_call_prem_oi": 0.0,
-        "total_put_prem_oi": 0.0,
-        "spot_change_pct": 0.0,
-        "iv_rising": False,
     }
 
 
 calculate_tactical_metrics = getattr(gex_engine, "calculate_tactical_metrics", _fallback_tactical_metrics)
 
-# Funciones con caché para optimizar consultas de la API
+# Funciones con caché para optimizar consultas de la API (60s para datos en vivo)
 @st.cache_data(ttl=300)
 def cached_options_expirations(ticker, api_key):
     return get_options_expirations(ticker, api_key)
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)
 def cached_fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, mode):
     return fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, mode=mode)
 
@@ -155,10 +162,11 @@ rango_pct = st.sidebar.slider(
     step=5
 )
 
-# Botón para forzar actualización (limpia la caché)
+# Botón para forzar actualización (limpia la caché y fuerza recálculo en sesión)
 if st.sidebar.button("🔄 Forzar Actualización", use_container_width=True):
     st.cache_data.clear()
-    st.sidebar.success("Caché limpiada con éxito.")
+    st.session_state.force_refresh = True
+    st.sidebar.success("Caché limpiada. Actualizando datos en vivo...")
     st.rerun()
 
 
@@ -451,13 +459,29 @@ if st.session_state.expirations:
         default=st.session_state.expirations[0] if st.session_state.expirations else []
     )
     
-    col_calc_btn, _ = st.columns([2, 5])
+    col_calc_btn, col_refresh_btn, col_ts = st.columns([2, 2, 3])
     with col_calc_btn:
         btn_calc = st.button("3. Calcular GEX y Scanner", use_container_width=True, type="primary")
+    with col_refresh_btn:
+        btn_refresh_live = st.button("🔄 Actualizar En Vivo", use_container_width=True)
+        if btn_refresh_live:
+            cached_fetch_and_calculate_all.clear()
+            cached_fetch_live_flow.clear()
+            st.session_state.force_refresh = True
+    with col_ts:
+        ts_placeholder = st.empty()
 
-    # Si se hace clic en calcular, corremos el scanner
-    if btn_calc or 'gex_results' in st.session_state:
-        if btn_calc or ticker != st.session_state.get('results_ticker') or engine_mode != st.session_state.get('results_mode'):
+    # Si se hace clic en calcular o actualizar, corremos el scanner
+    force_refresh = st.session_state.pop("force_refresh", False)
+    exp_key = tuple(selected_expirations)
+    if btn_calc or force_refresh or 'gex_results' in st.session_state:
+        if (
+            btn_calc
+            or force_refresh
+            or ticker != st.session_state.get('results_ticker')
+            or engine_mode != st.session_state.get('results_mode')
+            or exp_key != st.session_state.get('results_exps')
+        ):
             with st.spinner("Descargando libro de opciones y calculando GEX..."):
                 df_gex, df_dex, df_raw, spot = cached_fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, mode=engine_mode)
                 
@@ -471,7 +495,16 @@ if st.session_state.expirations:
                     st.session_state.raw_data = df_raw
                     st.session_state.results_ticker = ticker
                     st.session_state.results_mode = engine_mode
-        
+                    st.session_state.results_exps = exp_key
+                    st.session_state.last_updated_str = now_ca_str()
+
+        last_ts = st.session_state.get("last_updated_str")
+        if last_ts:
+            ts_placeholder.markdown(
+                f"<div style='padding-top:8px;color:#8b949e;font-size:13px;'>🕒 Última actualización: <b style='color:#c9d1d9;'>{last_ts} PT</b> (California · caché 60s)</div>",
+                unsafe_allow_html=True,
+            )
+
         # Mostrar Resultados si existen en sesión
         if 'gex_results' in st.session_state:
             res = st.session_state.gex_results
@@ -783,9 +816,104 @@ if st.session_state.expirations:
             em_low = tac["em_low_1d"]
             em_high = tac["em_high_1d"]
             atm_iv_pct = tac["atm_iv"] * 100.0
+            spot_now = res["Spot Price"]
+            tot_gex_now = res["Total Net GEX"]
+            f_dir_now = str(lf_summary.get("flow_direction", "no_flow")).lower()
+
+            # Rastreador de tendencia de IV ATM y Spot en vivo (por ticker y vencimientos en la sesión)
+            iv_hist_key = f"{ticker}|{'_'.join(map(str, selected_expirations))}"
+            if "iv_history_map" not in st.session_state:
+                st.session_state.iv_history_map = {}
+            iv_hist = st.session_state.iv_history_map.get(iv_hist_key, [])
+            cur_ts_lbl = st.session_state.get("last_updated_str") or now_ca_str()
+            if not iv_hist or iv_hist[-1]["ts"] != cur_ts_lbl:
+                iv_hist.append({"ts": cur_ts_lbl, "iv": round(atm_iv_pct, 2), "spot": round(spot_now, 4)})
+                iv_hist = iv_hist[-20:]
+                st.session_state.iv_history_map[iv_hist_key] = iv_hist
+
+            iv_base = iv_hist[0]["iv"]
+            spot_base = float(iv_hist[0].get("spot", spot_now) or spot_now)
+            if len(iv_hist) >= 2:
+                iv_prev = iv_hist[-2]["iv"]
+                iv_diff_prev = atm_iv_pct - iv_prev
+                iv_diff_base = atm_iv_pct - iv_base
+                iv_ref_diff = iv_diff_prev if abs(iv_diff_prev) >= 0.1 else iv_diff_base
+                if iv_ref_diff >= 0.15:
+                    iv_state = "up"
+                    iv_badge_txt = f"▲ +{iv_ref_diff:.1f}% SUBIENDO"
+                    iv_badge_fg = "#ff4d4d"
+                    iv_badge_bg = "rgba(255,77,77,0.18)"
+                elif iv_ref_diff <= -0.15:
+                    iv_state = "down"
+                    iv_badge_txt = f"▼ {iv_ref_diff:.1f}% BAJANDO"
+                    iv_badge_fg = "#2ecc71"
+                    iv_badge_bg = "rgba(46,204,113,0.18)"
+                else:
+                    iv_state = "flat"
+                    iv_badge_txt = f"● ESTABLE ({iv_ref_diff:+.1f}%)"
+                    iv_badge_fg = "#8b949e"
+                    iv_badge_bg = "rgba(139,148,158,0.18)"
+                iv_meta_extra = f" · Base: <b>{iv_base:.1f}%</b>"
+
+                spot_prev = float(iv_hist[-2].get("spot", spot_now) or spot_now)
+                spot_pct_prev = ((spot_now - spot_prev) / spot_prev * 100.0) if spot_prev > 0 else 0.0
+                spot_pct_base = ((spot_now - spot_base) / spot_base * 100.0) if spot_base > 0 else 0.0
+                spot_ref_pct = spot_pct_prev if abs(spot_pct_prev) >= 0.08 else spot_pct_base
+                if spot_ref_pct >= 0.08:
+                    spot_state = "up"
+                elif spot_ref_pct <= -0.08:
+                    spot_state = "down"
+                else:
+                    spot_state = "flat"
+            else:
+                iv_state = "base"
+                iv_badge_txt = "● BASE"
+                iv_badge_fg = "#8b949e"
+                iv_badge_bg = "rgba(139,148,158,0.18)"
+                iv_meta_extra = " · Refresca para tendencia"
+                spot_state = "base"
+                spot_ref_pct = 0.0
 
             vex_color = "#2ecc71" if net_vex_val >= 0 else "#ff4d4d"
-            vex_sub = "Si IV baja → Dealers compran (Alcista)" if net_vex_val >= 0 else "Si IV sube → Acelera ventas (Bajista)"
+            vex_border_color = vex_color
+            vex_pill_txt = "EN ESPERA"
+            vex_pill_fg = "#8b949e"
+            vex_pill_bg = "rgba(139,148,158,0.18)"
+            if net_vex_val < 0:
+                if iv_state == "up":
+                    vex_sub = "VEX negativo + IV subiendo → Aceleración bajista ACTIVA"
+                    vex_sub_color = "#ff4d4d"
+                    vex_pill_txt = "ACTIVA"
+                    vex_pill_fg = "#ff4d4d"
+                    vex_pill_bg = "rgba(255,77,77,0.20)"
+                elif iv_state == "down":
+                    vex_sub = "IV bajando → Presión Vanna cediendo (posible freno/rebote)"
+                    vex_sub_color = "#2ecc71"
+                    vex_border_color = "#2ecc71"
+                    vex_pill_txt = "CEDIENDO"
+                    vex_pill_fg = "#2ecc71"
+                    vex_pill_bg = "rgba(46,204,113,0.18)"
+                else:
+                    vex_sub = "Si IV sube → Acelera ventas (Bajista)"
+                    vex_sub_color = "#c9d1d9"
+            else:
+                if iv_state == "down":
+                    vex_sub = "VEX positivo + IV bajando → Empuje alcista ACTIVO"
+                    vex_sub_color = "#2ecc71"
+                    vex_pill_txt = "ACTIVO"
+                    vex_pill_fg = "#2ecc71"
+                    vex_pill_bg = "rgba(46,204,113,0.18)"
+                elif iv_state == "up":
+                    vex_sub = "IV subiendo → Empuje Vanna frenado / cautela"
+                    vex_sub_color = "#ffcc00"
+                    vex_border_color = "#ffcc00"
+                    vex_pill_txt = "FRENADO"
+                    vex_pill_fg = "#ffcc00"
+                    vex_pill_bg = "rgba(255,204,0,0.18)"
+                else:
+                    vex_sub = "Si IV baja → Dealers compran (Alcista)"
+                    vex_sub_color = "#c9d1d9"
+
             chex_color = "#2ecc71" if net_chex_val >= 0 else "#ff4d4d"
             chex_sub = "Paso del tiempo → Empuje alcista" if net_chex_val >= 0 else "Paso del tiempo → Presión bajista"
             pin_color = "#ffcc00" if pin_sc >= 65 else ("#2ecc71" if pin_sc >= 40 else "#8b949e")
@@ -793,10 +921,13 @@ if st.session_state.expirations:
             t_col1, t_col2, t_col3, t_col4 = st.columns(4)
             with t_col1:
                 st.markdown(
-                    f'<div style="background:#161b22;border:1px solid #30363d;border-left:4px solid {vex_color};border-radius:8px;padding:12px 16px;">'
-                    f'<p style="color:#8b949e;margin:0;font-size:12px;">VEX Neto (Vanna Exposure)</p>'
+                    f'<div style="background:#161b22;border:1px solid #30363d;border-left:4px solid {vex_border_color};border-radius:8px;padding:12px 16px;">'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">'
+                    f'<span style="color:#8b949e;font-size:12px;">VEX Neto (Vanna Exposure)</span>'
+                    f'<span style="background:{vex_pill_bg};color:{vex_pill_fg};font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;">{vex_pill_txt}</span>'
+                    f'</div>'
                     f'<p style="color:{vex_color};margin:4px 0 2px 0;font-size:22px;font-weight:800;">{format_millions(net_vex_val, engine_mode)}</p>'
-                    f'<p style="color:#c9d1d9;margin:0;font-size:11px;">{vex_sub}</p>'
+                    f'<p style="color:{vex_sub_color};margin:0;font-size:11px;">{vex_sub}</p>'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
@@ -821,215 +952,192 @@ if st.session_state.expirations:
             with t_col4:
                 st.markdown(
                     f'<div style="background:#161b22;border:1px solid #30363d;border-left:4px solid #348feb;border-radius:8px;padding:12px 16px;">'
-                    f'<p style="color:#8b949e;margin:0;font-size:12px;">Expected Move Hoy (IV {atm_iv_pct:.1f}%)</p>'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;flex-wrap:wrap;">'
+                    f'<span style="color:#8b949e;font-size:12px;">Expected Move · <b style="color:#ffffff;">IV {atm_iv_pct:.1f}%</b></span>'
+                    f'<span style="background:{iv_badge_bg};color:{iv_badge_fg};font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;">{iv_badge_txt}</span>'
+                    f'</div>'
                     f'<p style="color:#ffffff;margin:4px 0 2px 0;font-size:22px;font-weight:800;">±${em_1d:.2f} <span style="font-size:13px;color:#348feb;">(±{em_1d_pct:.1f}%)</span></p>'
-                    f'<p style="color:#c9d1d9;margin:0;font-size:11px;">Rango: <b>${em_low:.2f}</b> ◄──► <b>${em_high:.2f}</b></p>'
+                    f'<p style="color:#c9d1d9;margin:0;font-size:11px;">Rango: <b>${em_low:.2f}</b> ◄──► <b>${em_high:.2f}</b>{iv_meta_extra}</p>'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
 
-            # Barra de Veredicto Operativo Automático + Radar de 4 Señales en Tiempo Real (con Hora Exacta HH:MM:SS, Silbato Festivo, Sirena y Voz)
-            spot_now = res["Spot Price"]
-            tot_gex_now = res["Total Net GEX"]
-            gamma_flip_now = res.get("Zero GEX (Balance)", spot_now)
-            f_dir_now = str(lf_summary.get("flow_direction", "no_flow")).lower()
+            # Detector de Squeeze & Confluencias en Vivo (Las 4 Opciones Visibles al Mismo Tiempo + Hora Exacta HH:MM:SS + Silbato Festivo, Sirena y Voz)
+            c_prem_sq = tac["total_call_prem_vol"]
+            p_prem_sq = tac["total_put_prem_vol"]
+            tot_prem_sq = c_prem_sq + p_prem_sq
+            call_share_sq = (c_prem_sq / tot_prem_sq * 100.0) if tot_prem_sq > 0 else 50.0
+            put_share_sq = 100.0 - call_share_sq
+            near_cwall = c_wall > 0 and spot_now >= c_wall * 0.995
+            near_pwall = p_wall > 0 and spot_now <= p_wall * 1.005
+            dist_pin_pct = (abs(spot_now - pin_st) / spot_now * 100.0) if spot_now > 0 else 99.0
 
-            # Calcular variación % del Spot (desde tactical, o comparando contra sesión previa / yfinance)
-            if "prev_spot_map" not in st.session_state:
-                st.session_state.prev_spot_map = {}
-            if "prev_iv_map" not in st.session_state:
-                st.session_state.prev_iv_map = {}
+            bull_sq_checks = [
+                (spot_state == "up", f"Spot ▲ ({spot_ref_pct:+.2f}%)" if spot_state == "up" else "Spot ▲"),
+                (iv_state == "up", "IV ▲"),
+                (call_share_sq >= 58.0 or f_dir_now == "bullish", f"Calls {call_share_sq:.0f}%"),
+                (tot_gex_now < 0 or near_cwall, "Gamma− / Call Wall"),
+            ]
+            bear_sq_checks = [
+                (spot_state == "down", f"Spot ▼ ({spot_ref_pct:+.2f}%)" if spot_state == "down" else "Spot ▼"),
+                (iv_state == "up", "IV ▲"),
+                (put_share_sq >= 60.0 or f_dir_now == "bearish", f"Puts {put_share_sq:.0f}%"),
+                ((tot_gex_now < 0 and net_vex_val < 0) or (tot_gex_now < 0 and near_pwall), "Gamma− + VEX−"),
+            ]
+            vanna_checks = [
+                (spot_state == "up" or (spot_now >= p_wall and spot_state != "down"), "Spot firme"),
+                (iv_state == "down", "IV ▼"),
+                (net_vex_val > 0 or net_chex_val > 0, "VEX+ / CHEX+"),
+                (tot_gex_now >= 0 or spot_now > p_wall, "Arriba Put Wall"),
+            ]
+            pin_checks = [
+                (dist_pin_pct <= 0.6, f"Cerca Pin ${pin_st:g}"),
+                (pin_sc >= 65.0, f"Pin {pin_sc:.0f}/100"),
+                (iv_state in ("down", "flat"), "IV ▼/●"),
+                ((p_wall <= spot_now <= c_wall) if c_wall > p_wall else (spot_state == "flat"), "En rango"),
+            ]
+
             if "signal_activation_times" not in st.session_state:
                 st.session_state.signal_activation_times = {}
             if "signal_history_log" not in st.session_state:
                 st.session_state.signal_history_log = []
 
-            spot_chg_pct = float(tac.get("spot_change_pct", 0.0) or 0.0)
-            prev_spot_val = st.session_state.prev_spot_map.get(ticker)
-            if spot_chg_pct == 0.0 and prev_spot_val and prev_spot_val > 0 and abs(spot_now - prev_spot_val) > 1e-6:
-                spot_chg_pct = ((spot_now - prev_spot_val) / prev_spot_val) * 100.0
-            if spot_chg_pct == 0.0:
-                try:
-                    import yfinance as yf
-                    t_fast = yf.Ticker(ticker).fast_info
-                    p_close = float(t_fast.get("previousClose") or t_fast.get("regularMarketPreviousClose") or 0.0)
-                    if p_close > 0:
-                        spot_chg_pct = ((spot_now - p_close) / p_close) * 100.0
-                except Exception:
-                    pass
-            st.session_state.prev_spot_map[ticker] = spot_now
-
-            # Determinar tendencia de IV (IV ▲ vs IV ▼)
-            prev_iv_val = st.session_state.prev_iv_map.get(ticker)
-            if prev_iv_val is not None and abs(atm_iv_pct - prev_iv_val) >= 0.05:
-                iv_is_rising = atm_iv_pct > prev_iv_val
-            else:
-                iv_is_rising = bool(tac.get("iv_rising", atm_iv_pct >= 25.0))
-            st.session_state.prev_iv_map[ticker] = atm_iv_pct
-
-            # Dominancia de Puts vs Calls (% de Prima de Volumen hoy, con fallback a Prima de OI si mercado cerrado)
-            c_prem_flow = float(tac.get("total_call_prem_vol", 0.0) or 0.0)
-            p_prem_flow = float(tac.get("total_put_prem_vol", 0.0) or 0.0)
-            if (c_prem_flow + p_prem_flow) <= 0:
-                c_prem_flow = float(tac.get("total_call_prem_oi", 0.0) or (df_gex["call_prem_oi"].sum() if "call_prem_oi" in df_gex.columns else 0.0))
-                p_prem_flow = float(tac.get("total_put_prem_oi", 0.0) or (df_gex["put_prem_oi"].sum() if "put_prem_oi" in df_gex.columns else 0.0))
-            tot_prem_flow = c_prem_flow + p_prem_flow
-            puts_dom_pct = (p_prem_flow / tot_prem_flow * 100.0) if tot_prem_flow > 0 else 50.0
-            calls_dom_pct = (c_prem_flow / tot_prem_flow * 100.0) if tot_prem_flow > 0 else 50.0
-
-            spot_down = spot_chg_pct < 0
-            spot_up = spot_chg_pct > 0
-            spot_arrow = "▼" if spot_down else ("▲" if spot_up else "•")
-            iv_arrow = "▲" if iv_is_rising else "▼"
-
-            # Definición de las 4 Señales Tácticas Simultáneas (cada una con sus 4 requisitos)
-            signals_config = [
+            four_scenarios = [
                 {
-                    "id": "cascada_bajista",
-                    "direction": "bearish",
-                    "sound_type": "siren",
+                    "id": "bull_squeeze",
+                    "icon": "🚀",
+                    "title": "SQUEEZE ALCISTA",
+                    "active_title": "SQUEEZE ALCISTA CONFIRMADO",
+                    "pre_title": "PRE-ALERTA SQUEEZE ALCISTA",
+                    "note": "Precio + IV subiendo con flujo agresivo en Calls (FOMO / cobertura alcista).",
+                    "voice_name": "Squeeze Alcista",
+                    "sound_type": "whistle",
+                    "direction": "bullish",
+                    "active_clr": "#2ecc71",
+                    "active_bg": "rgba(46,204,113,0.14)",
+                    "pre_clr": "#ffcc00",
+                    "pre_bg": "rgba(255,204,0,0.10)",
+                    "checks": bull_sq_checks,
+                },
+                {
+                    "id": "bear_cascade",
                     "icon": "💥",
                     "title": "CASCADA BAJISTA",
-                    "desc": "Gamma- + VEX- + IV subiendo con Puts dominando (aceleración bajista).",
+                    "active_title": "CASCADA BAJISTA ACTIVA",
+                    "pre_title": "ALERTA PRESIÓN BAJISTA",
+                    "note": "Gamma− + VEX− + IV subiendo con Puts dominando (aceleración bajista).",
                     "voice_name": "Cascada Bajista",
-                    "reqs": [
-                        {"label": f"Spot ▼ ({spot_chg_pct:+.2f}%)", "met": spot_down},
-                        {"label": f"IV ▲ ({atm_iv_pct:.1f}%)", "met": iv_is_rising},
-                        {"label": f"Puts {puts_dom_pct:.0f}%", "met": puts_dom_pct >= 55.0},
-                        {"label": "Gamma- + VEX-", "met": (tot_gex_now < 0 and net_vex_val < 0)},
-                    ],
-                },
-                {
-                    "id": "squeeze_alcista",
-                    "direction": "bullish",
-                    "sound_type": "whistle",
-                    "icon": "🎉",
-                    "title": "SQUEEZE ALCISTA",
-                    "desc": "Gamma+ + VEX+ + IV bajando con Calls dominando (aceleración alcista).",
-                    "voice_name": "Squeeze Alcista",
-                    "reqs": [
-                        {"label": f"Spot ▲ ({spot_chg_pct:+.2f}%)", "met": spot_up},
-                        {"label": f"IV ▼ ({atm_iv_pct:.1f}%)", "met": not iv_is_rising},
-                        {"label": f"Calls {calls_dom_pct:.0f}%", "met": calls_dom_pct >= 55.0},
-                        {"label": "Gamma+ + VEX+", "met": (tot_gex_now >= 0 and net_vex_val >= 0)},
-                    ],
-                },
-                {
-                    "id": "rebote_vanna",
-                    "direction": "bullish",
-                    "sound_type": "whistle",
-                    "icon": "🚀",
-                    "title": "REBOTE VANNA (SHORT COVER)",
-                    "desc": "Gamma- + IV cayendo con Calls dominando (quema de Puts y cierre forzado de cortos).",
-                    "voice_name": "Rebote Vanna Alcista",
-                    "reqs": [
-                        {"label": f"Spot ▲ ({spot_chg_pct:+.2f}%)", "met": spot_up},
-                        {"label": f"IV ▼ ({atm_iv_pct:.1f}%)", "met": not iv_is_rising},
-                        {"label": f"Calls {calls_dom_pct:.0f}%", "met": calls_dom_pct >= 55.0},
-                        {"label": "Gamma- (Rebote Rápido)", "met": tot_gex_now < 0},
-                    ],
-                },
-                {
-                    "id": "presion_bajista_charm",
-                    "direction": "bearish",
                     "sound_type": "siren",
-                    "icon": "🚨",
-                    "title": "PRESIÓN BAJISTA (DEBAJO DE FLIP)",
-                    "desc": "Spot debajo del Gamma Flip + CHEX/VEX negativos con flujo Put dominante.",
-                    "voice_name": "Presión Bajista bajo Gamma Flip",
-                    "reqs": [
-                        {"label": f"Spot < Flip (${gamma_flip_now:.1f})", "met": spot_now < gamma_flip_now},
-                        {"label": f"Spot ▼ ({spot_chg_pct:+.2f}%)", "met": spot_down},
-                        {"label": f"Puts {puts_dom_pct:.0f}%", "met": puts_dom_pct >= 55.0},
-                        {"label": "CHEX- / VEX-", "met": (net_chex_val < 0 or net_vex_val < 0)},
-                    ],
+                    "direction": "bearish",
+                    "active_clr": "#ff4d4d",
+                    "active_bg": "rgba(255,77,77,0.14)",
+                    "pre_clr": "#ff8c00",
+                    "pre_bg": "rgba(255,140,0,0.11)",
+                    "checks": bear_sq_checks,
+                },
+                {
+                    "id": "vanna_rally",
+                    "icon": "🟢",
+                    "title": "VANNA RALLY / SUBIDA CONTROLADA",
+                    "active_title": "VANNA RALLY ACTIVO",
+                    "pre_title": "PRE-ALERTA VANNA RALLY",
+                    "note": "IV bajando con soporte estructural (empuje alcista ordenado).",
+                    "voice_name": "Vanna Rally Alcista",
+                    "sound_type": "whistle",
+                    "direction": "bullish",
+                    "active_clr": "#2ecc71",
+                    "active_bg": "rgba(46,204,113,0.12)",
+                    "pre_clr": "#ffcc00",
+                    "pre_bg": "rgba(255,204,0,0.10)",
+                    "checks": vanna_checks,
+                },
+                {
+                    "id": "pin_mode",
+                    "icon": "🧲",
+                    "title": "MODO PIN / COMPRESIÓN",
+                    "active_title": "MODO PIN / COMPRESIÓN ACTIVO",
+                    "pre_title": "CERCA DE MODO PIN",
+                    "note": "Precio atrapado cerca del Pin quemando prima (precaución con theta).",
+                    "voice_name": "Modo Pin y Compresión",
+                    "sound_type": "pin",
+                    "direction": "neutral",
+                    "active_clr": "#ffcc00",
+                    "active_bg": "rgba(255,204,0,0.13)",
+                    "pre_clr": "#d4a017",
+                    "pre_bg": "rgba(212,160,23,0.09)",
+                    "checks": pin_checks,
                 },
             ]
 
-            now_dt = datetime.datetime.now()
-            now_str = now_dt.strftime("%H:%M:%S")
+            now_clock_str = now_ca_str()
             newly_triggered_signals = []
 
-            for sig in signals_config:
-                met_count = sum(1 for r in sig["reqs"] if r["met"])
-                total_reqs = len(sig["reqs"])
-                sig["met_count"] = met_count
-                sig["total_reqs"] = total_reqs
-                sig["is_active"] = (met_count == total_reqs)
+            for sc in four_scenarios:
+                met_n = sum(1 for ok, _ in sc["checks"] if ok)
+                tot_n = len(sc["checks"])
+                sc["met_n"] = met_n
+                sc["tot_n"] = tot_n
+                sc["is_active"] = (met_n == tot_n)
 
-                state_key = f"{ticker}_{sig['id']}"
-                prev_info = st.session_state.signal_activation_times.get(state_key)
+                st_key = f"{ticker}_{sc['id']}"
+                prev_st = st.session_state.signal_activation_times.get(st_key)
 
-                if sig["is_active"]:
-                    if not prev_info or not prev_info.get("active"):
-                        # Se acaba de activar (4/4): guardar hora, minuto y segundo exactos
-                        st.session_state.signal_activation_times[state_key] = {
+                if sc["is_active"]:
+                    if not prev_st or not prev_st.get("active"):
+                        st.session_state.signal_activation_times[st_key] = {
                             "active": True,
-                            "time_str": now_str,
+                            "time_str": now_clock_str,
                             "timestamp": time.time(),
                         }
-                        sig["activated_at"] = now_str
-                        sig["elapsed_txt"] = "recién activada"
+                        sc["activated_at"] = now_clock_str
+                        sc["elapsed_txt"] = "recién activada"
                         newly_triggered_signals.append({
-                            "id": sig["id"],
-                            "title": sig["title"],
-                            "voice_name": sig["voice_name"],
-                            "sound_type": sig["sound_type"],
-                            "direction": sig["direction"],
-                            "time_str": now_str,
+                            "id": sc["id"],
+                            "title": sc["active_title"],
+                            "voice_name": sc["voice_name"],
+                            "sound_type": sc["sound_type"],
+                            "direction": sc["direction"],
+                            "time_str": now_clock_str,
                             "ticker": ticker,
                         })
                         st.session_state.signal_history_log.insert(0, {
-                            "time_str": now_str,
+                            "time_str": now_clock_str,
                             "ticker": ticker,
-                            "icon": sig["icon"],
-                            "title": sig["title"],
-                            "direction": sig["direction"],
+                            "icon": sc["icon"],
+                            "title": sc["active_title"],
+                            "direction": sc["direction"],
                         })
                         st.session_state.signal_history_log = st.session_state.signal_history_log[:12]
                     else:
-                        # Ya estaba activa: mantener fija la hora exacta original en que se activó
-                        sig["activated_at"] = prev_info["time_str"]
-                        elapsed_s = max(0, int(time.time() - prev_info["timestamp"]))
-                        if elapsed_s < 60:
-                            sig["elapsed_txt"] = f"hace {elapsed_s}s"
-                        else:
-                            sig["elapsed_txt"] = f"hace {elapsed_s // 60}m {elapsed_s % 60:02d}s"
+                        sc["activated_at"] = prev_st["time_str"]
+                        el_s = max(0, int(time.time() - prev_st["timestamp"]))
+                        sc["elapsed_txt"] = f"hace {el_s}s" if el_s < 60 else f"hace {el_s // 60}m {el_s % 60:02d}s"
                 else:
-                    # Si baja de 4/4, guardar la última hora en que estuvo activa pero marcar active=False
-                    last_t = prev_info.get("time_str") if prev_info else None
-                    st.session_state.signal_activation_times[state_key] = {
+                    last_t = prev_st.get("time_str") if prev_st else None
+                    st.session_state.signal_activation_times[st_key] = {
                         "active": False,
                         "time_str": last_t,
-                        "timestamp": prev_info.get("timestamp", 0) if prev_info else 0,
+                        "timestamp": prev_st.get("timestamp", 0) if prev_st else 0,
                     }
-                    sig["activated_at"] = None
-                    sig["last_activated_at"] = last_t
+                    sc["activated_at"] = None
+                    sc["last_activated_at"] = last_t
 
-            # Renderizar Encabezado del Radar de 4 Señales + Controles de Audio (Silbato Festivo / Sirena + Voz)
-            st.markdown(
-                "<h3 style='margin-top:18px;margin-bottom:6px;color:#ffffff;font-size:18px;font-weight:800;'>"
-                "🔔 RADAR DE 4 SEÑALES EN TIEMPO REAL (Checklist 4/4 + Hora Exacta + Alarma con Voz)"
-                "</h3>",
-                unsafe_allow_html=True,
-            )
-
-            # Componente HTML/JS de Audio (Web Audio API para Silbato Festivo y Sirena + speechSynthesis en Español)
+            # Barra de control de Audio (Silbato Festivo + Sirena + Voz en Español)
             triggered_json = json.dumps(newly_triggered_signals)
             audio_component_html = f"""
-            <div style="background:#11161f;border:1px solid #283040;border-radius:10px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;font-family:'Inter',sans-serif;">
+            <div style="background:#11161f;border:1px solid #283040;border-radius:10px;padding:9px 14px;margin-top:12px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;font-family:'Inter',sans-serif;">
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                    <span style="color:#e6edf3;font-size:13px;font-weight:700;">🔊 Alarmas Sonoras y Voz ({ticker}):</span>
-                    <span id="audio_status_badge" style="background:#132a1c;border:1px solid #2ecc71;color:#2ecc71;font-size:11.5px;font-weight:700;padding:2px 9px;border-radius:999px;">AUDIO + VOZ ACTIVOS</span>
+                    <span style="color:#e6edf3;font-size:13px;font-weight:700;">🔊 Radar de 4 Señales y Alarmas ({ticker}):</span>
+                    <span id="audio_status_badge" style="background:#132a1c;border:1px solid #2ecc71;color:#2ecc71;font-size:11px;font-weight:700;padding:2px 9px;border-radius:999px;">AUDIO + VOZ ACTIVOS</span>
                 </div>
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                    <button onclick="testWhistleAlert()" style="background:#132f20;border:1px solid #2ecc71;color:#7ee787;padding:5px 11px;border-radius:7px;font-size:12px;font-weight:700;cursor:pointer;">
+                    <button onclick="testWhistleAlert()" style="background:#132f20;border:1px solid #2ecc71;color:#7ee787;padding:4px 10px;border-radius:7px;font-size:11.5px;font-weight:700;cursor:pointer;">
                         🎉 Probar Silbato + Voz (Subida)
                     </button>
-                    <button onclick="testSirenAlert()" style="background:#341417;border:1px solid #ff4d4d;color:#ff7b72;padding:5px 11px;border-radius:7px;font-size:12px;font-weight:700;cursor:pointer;">
+                    <button onclick="testSirenAlert()" style="background:#341417;border:1px solid #ff4d4d;color:#ff7b72;padding:4px 10px;border-radius:7px;font-size:11.5px;font-weight:700;cursor:pointer;">
                         🚨 Probar Sirena + Voz (Caída)
                     </button>
-                    <button id="mute_btn" onclick="toggleMute()" style="background:#1c212b;border:1px solid #3a4252;color:#c9d1d9;padding:5px 11px;border-radius:7px;font-size:12px;font-weight:600;cursor:pointer;">
+                    <button id="mute_btn" onclick="toggleMute()" style="background:#1c212b;border:1px solid #3a4252;color:#c9d1d9;padding:4px 10px;border-radius:7px;font-size:11.5px;font-weight:600;cursor:pointer;">
                         🔇 Silenciar
                     </button>
                 </div>
@@ -1066,7 +1174,7 @@ if st.session_state.expirations:
                     updateMuteUI();
                 }};
 
-                // Silbato Festivo de Alegría (Party Whistle / Corneta de Cumpleaños + Fanfarria Alegre)
+                // Silbato Festivo de Alegría (Subida)
                 window.playFestiveWhistle = function(onDone) {{
                     if (isMuted) return;
                     try {{
@@ -1074,7 +1182,6 @@ if st.session_state.expirations:
                         const ctx = new AudioCtx();
                         const now = ctx.currentTime;
 
-                        // 1. Primer silbato festivo ascendente con vibrato alegre ("fiuuu-iiit!")
                         const osc1 = ctx.createOscillator();
                         const gain1 = ctx.createGain();
                         const lfo = ctx.createOscillator();
@@ -1086,7 +1193,6 @@ if st.session_state.expirations:
                         osc1.frequency.setValueAtTime(1480, now + 0.55);
                         osc1.frequency.exponentialRampToValueAtTime(1180, now + 0.68);
 
-                        // Vibrato rápido de silbato de fiesta
                         lfo.frequency.setValueAtTime(22, now);
                         lfoGain.gain.setValueAtTime(45, now);
                         lfo.connect(lfoGain);
@@ -1104,8 +1210,7 @@ if st.session_state.expirations:
                         lfo.stop(now + 0.70);
                         osc1.stop(now + 0.70);
 
-                        // 2. Segundo silbato festivo más alto y brillante + acorde alegre
-                        const notes = [1046.5, 1318.5, 1567.98, 2093.0]; // Do6 - Mi6 - Sol6 - Do7
+                        const notes = [1046.5, 1318.5, 1567.98, 2093.0];
                         notes.forEach((freq, idx) => {{
                             const osc = ctx.createOscillator();
                             const g = ctx.createGain();
@@ -1131,7 +1236,7 @@ if st.session_state.expirations:
                     }}
                 }};
 
-                // Sirena de Alarma para Caída (Sirena Oscilante de Emergencia)
+                // Sirena de Alarma (Caída)
                 window.playSirenAlarm = function(onDone) {{
                     if (isMuted) return;
                     try {{
@@ -1143,7 +1248,6 @@ if st.session_state.expirations:
                         const gain = ctx.createGain();
                         osc.type = 'sawtooth';
 
-                        // 2 ciclos de sirena intensa ("uuu-aaa, uuu-aaa")
                         osc.frequency.setValueAtTime(420, now);
                         osc.frequency.linearRampToValueAtTime(880, now + 0.35);
                         osc.frequency.linearRampToValueAtTime(380, now + 0.75);
@@ -1168,7 +1272,6 @@ if st.session_state.expirations:
                     }}
                 }};
 
-                // Narrador de Voz en Español
                 window.speakSpanishAlert = function(text) {{
                     if (isMuted || !('speechSynthesis' in window)) return;
                     try {{
@@ -1186,18 +1289,14 @@ if st.session_state.expirations:
 
                 function getNowTimeVoice() {{
                     const d = new Date();
-                    const pad = n => String(n).padStart(2, '0');
-                    return {{
-                        clock: pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()),
-                        spoken: d.getHours() + ' horas con ' + d.getMinutes() + ' minutos y ' + d.getSeconds() + ' segundos'
-                    }};
+                    return d.getHours() + ' horas con ' + d.getMinutes() + ' minutos y ' + d.getSeconds() + ' segundos';
                 }}
 
                 window.testWhistleAlert = function() {{
                     if (isMuted) window.toggleMute();
                     const t = getNowTimeVoice();
                     window.playFestiveWhistle(() => {{
-                        window.speakSpanishAlert('¡Señal de subida! Squeeze Alcista cuatro de cuatro activado en {ticker} a las ' + t.spoken);
+                        window.speakSpanishAlert('¡Señal de subida! Squeeze Alcista cuatro de cuatro activado en {ticker} a las ' + t);
                     }});
                 }};
 
@@ -1205,11 +1304,10 @@ if st.session_state.expirations:
                     if (isMuted) window.toggleMute();
                     const t = getNowTimeVoice();
                     window.playSirenAlarm(() => {{
-                        window.speakSpanishAlert('¡Alerta de caída! Cascada Bajista cuatro de cuatro activada en {ticker} a las ' + t.spoken);
+                        window.speakSpanishAlert('¡Alerta de caída! Cascada Bajista cuatro de cuatro activada en {ticker} a las ' + t);
                     }});
                 }};
 
-                // Disparar automáticamente cuando una señal acaba de llegar a 4/4
                 const newlyTriggered = {triggered_json};
                 if (newlyTriggered && newlyTriggered.length > 0 && !isMuted) {{
                     const firstSig = newlyTriggered[0];
@@ -1218,131 +1316,104 @@ if st.session_state.expirations:
                         ? (parseInt(parts[0], 10) + ' horas con ' + parseInt(parts[1], 10) + ' minutos y ' + parseInt(parts[2], 10) + ' segundos')
                         : firstSig.time_str;
 
-                    if (firstSig.sound_type === 'whistle') {{
-                        window.playFestiveWhistle(() => {{
-                            window.speakSpanishAlert('¡Atención! Señal de subida: ' + firstSig.voice_name + ' cuatro de cuatro activada en ' + firstSig.ticker + ' a las ' + spokenTime);
-                        }});
-                    }} else {{
+                    if (firstSig.sound_type === 'siren') {{
                         window.playSirenAlarm(() => {{
                             window.speakSpanishAlert('¡Alerta de caída! ' + firstSig.voice_name + ' cuatro de cuatro activada en ' + firstSig.ticker + ' a las ' + spokenTime);
+                        }});
+                    }} else {{
+                        window.playFestiveWhistle(() => {{
+                            window.speakSpanishAlert('¡Atención! Señal ' + firstSig.voice_name + ' cuatro de cuatro activada en ' + firstSig.ticker + ' a las ' + spokenTime);
                         }});
                     }}
                 }}
             }})();
             </script>
             """
-            components.html(audio_component_html, height=62, scrolling=False)
+            components.html(audio_component_html, height=58, scrolling=False)
 
-            # Renderizar las 4 Tarjetas Simultáneas en un Grid de 2x2
-            grid_col1, grid_col2 = st.columns(2)
-            for idx_sig, sig in enumerate(signals_config):
-                target_col = grid_col1 if idx_sig % 2 == 0 else grid_col2
-                is_act = sig["is_active"]
-                m_cnt = sig["met_count"]
-                t_cnt = sig["total_reqs"]
-                is_bear = sig["direction"] == "bearish"
+            # Renderizar las 4 Opciones Simultáneamente en un Grid 2x2
+            sq_col1, sq_col2 = st.columns(2)
+            for idx_sc, sc in enumerate(four_scenarios):
+                target_col = sq_col1 if idx_sc % 2 == 0 else sq_col2
+                met_n = sc["met_n"]
+                tot_n = sc["tot_n"]
 
-                if is_act:
-                    bg_card = "#2b1216" if is_bear else "#102819"
-                    border_col = "#ff4d4d" if is_bear else "#2ecc71"
-                    title_col = "#ff4d4d" if is_bear else "#2ecc71"
-                    status_lbl = f"{sig['title']} ACTIVA ({m_cnt}/{t_cnt})"
-                    box_shadow = f"0 0 16px {'rgba(255, 77, 77, 0.35)' if is_bear else 'rgba(46, 204, 113, 0.35)'}"
-                    time_badge_html = (
-                        f'<span style="background:{"#4a181f" if is_bear else "#173d26"};'
-                        f'border:1px solid {border_col};color:#ffffff;font-family:\'Courier New\',monospace;'
-                        f'font-size:12.5px;font-weight:800;padding:3px 10px;border-radius:999px;">'
-                        f'🕒 Activada: {sig["activated_at"]} ({sig["elapsed_txt"]})'
-                        f'</span>'
+                if met_n == 4:
+                    sq_title = f"{sc['icon']} {sc['active_title']} (4/4)"
+                    sq_clr = sc["active_clr"]
+                    sq_bg = sc["active_bg"]
+                    time_badge = (
+                        f'<span style="background:rgba(0,0,0,0.35);border:1px solid {sq_clr};color:#ffffff;'
+                        f'font-family:monospace;font-size:11.5px;font-weight:800;padding:2px 9px;border-radius:999px;">'
+                        f'🕒 Activada: {sc["activated_at"]} PT ({sc["elapsed_txt"]})</span>'
                     )
-                elif m_cnt == 3:
-                    bg_card = "#1a1710"
-                    border_col = "#ffcc00"
-                    title_col = "#ffcc00"
-                    status_lbl = f"{sig['title']} — CALENTANDO ({m_cnt}/{t_cnt})"
-                    box_shadow = "none"
-                    last_txt = f" | Últ. vez: {sig.get('last_activated_at')}" if sig.get("last_activated_at") else ""
-                    time_badge_html = (
-                        f'<span style="background:#2b2310;border:1px solid #ffcc00;color:#ffcc00;'
-                        f'font-family:monospace;font-size:11.5px;font-weight:700;padding:2px 9px;border-radius:999px;">'
-                        f'⏳ Falta 1 requisito{last_txt}'
-                        f'</span>'
+                elif met_n == 3:
+                    sq_title = f"🟠 {sc['pre_title']} (3/4)"
+                    sq_clr = sc["pre_clr"]
+                    sq_bg = sc["pre_bg"]
+                    last_txt = f" · Últ: {sc['last_activated_at']}" if sc.get("last_activated_at") else ""
+                    time_badge = (
+                        f'<span style="background:rgba(255,204,0,0.14);border:1px solid {sq_clr};color:{sq_clr};'
+                        f'font-family:monospace;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;">'
+                        f'⏳ Falta 1 requisito{last_txt}</span>'
                     )
                 else:
-                    bg_card = "#11151c"
-                    border_col = "#30363d"
-                    title_col = "#c9d1d9"
-                    status_lbl = f"{sig['title']} ({m_cnt}/{t_cnt})"
-                    box_shadow = "none"
-                    last_txt = f"Últ. activa: {sig.get('last_activated_at')}" if sig.get("last_activated_at") else "En espera (00:00:00)"
-                    time_badge_html = (
+                    sq_title = f"{sc['icon']} {sc['title']} ({met_n}/4)"
+                    sq_clr = "#8b949e"
+                    sq_bg = "rgba(139,148,158,0.08)"
+                    last_txt = f"Últ. activa: {sc['last_activated_at']} PT" if sc.get("last_activated_at") else "En espera"
+                    time_badge = (
                         f'<span style="background:#161b22;border:1px solid #30363d;color:#8b949e;'
-                        f'font-family:monospace;font-size:11.5px;padding:2px 9px;border-radius:999px;">'
-                        f'🕒 {last_txt}'
-                        f'</span>'
+                        f'font-family:monospace;font-size:11px;padding:2px 8px;border-radius:999px;">'
+                        f'🕒 {last_txt}</span>'
                     )
 
-                pills_html = ""
-                for req in sig["reqs"]:
-                    if req["met"]:
-                        p_bg = "#132a1c"
-                        p_border = "#2ecc71"
-                        p_color = "#e6edf3"
-                        p_icon = "✅"
-                    else:
-                        p_bg = "#161b22"
-                        p_border = "#30363d"
-                        p_color = "#8b949e"
-                        p_icon = "⬜"
-                    pills_html += (
-                        f'<span style="display:inline-flex;align-items:center;gap:5px;background:{p_bg};'
-                        f'border:1px solid {p_border};color:{p_color};padding:4px 11px;border-radius:999px;'
-                        f'font-size:12.5px;font-weight:700;">'
-                        f'{p_icon} {req["label"]}'
-                        f'</span>'
+                checks_parts = []
+                for ok, lbl in sc["checks"]:
+                    bg_c = "rgba(46,204,113,0.14)" if ok else "rgba(139,148,158,0.12)"
+                    fg_c = "#e6edf3" if ok else "#8b949e"
+                    bd_c = "rgba(46,204,113,0.35)" if ok else "#30363d"
+                    fw_c = "600" if ok else "400"
+                    ic_c = "✅" if ok else "⬜"
+                    checks_parts.append(
+                        f'<span style="background:{bg_c};color:{fg_c};border:1px solid {bd_c};'
+                        f'padding:2px 8px;border-radius:12px;font-size:11.5px;font-weight:{fw_c};">'
+                        f'{ic_c} {lbl}</span>'
                     )
+                checks_html = " ".join(checks_parts)
 
-                pct_bar = int((m_cnt / t_cnt) * 100)
-                bar_color = border_col if m_cnt >= 3 else ("#ff6b6b" if is_bear else "#3fb950")
-
-                card_html = (
-                    f'<div style="background:{bg_card};border:1.5px solid {border_col};border-left:5px solid {border_col};'
-                    f'border-radius:10px;padding:14px 16px;margin-bottom:14px;box-shadow:{box_shadow};">'
-                    f'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:6px;">'
-                    f'<span style="color:{title_col};font-weight:800;font-size:14.5px;letter-spacing:0.3px;">'
-                    f'{sig["icon"]} {status_lbl}'
-                    f'</span>'
-                    f'{time_badge_html}'
-                    f'</div>'
-                    f'<div style="color:#d0d7de;font-size:13px;margin-bottom:10px;">{sig["desc"]}</div>'
-                    f'<div style="width:100%;height:5px;background:#1c212b;border-radius:999px;overflow:hidden;margin-bottom:10px;">'
-                    f'<div style="width:{pct_bar}%;height:100%;background:{bar_color};"></div>'
-                    f'</div>'
-                    f'<div style="display:flex;flex-wrap:wrap;gap:8px;">{pills_html}</div>'
-                    f'</div>'
-                )
                 with target_col:
-                    st.markdown(card_html, unsafe_allow_html=True)
+                    st.markdown(
+                        f'<div style="background:{sq_bg};border:1px solid {sq_clr};border-left:4px solid {sq_clr};border-radius:8px;padding:10px 14px;margin-top:8px;">'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:4px;">'
+                        f'<span style="color:{sq_clr};font-weight:800;font-size:13.5px;">{sq_title}</span>'
+                        f'{time_badge}'
+                        f'</div>'
+                        f'<div style="color:#c9d1d9;font-size:12px;margin-bottom:8px;">{sc["note"]}</div>'
+                        f'<div style="display:flex;flex-wrap:wrap;gap:6px;">{checks_html}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
 
-            # Bitácora / Historial de Señales Activadas con Hora, Minuto y Segundo Exactos
+            if len(iv_hist) < 2:
+                st.caption("💡 Pulsa **🔄 Actualizar En Vivo** para registrar nuevos puntos de Spot e IV ATM en la sesión y activar la comparación de tendencia.")
+
             if st.session_state.signal_history_log:
-                log_items_html = ""
+                log_badges = []
                 for item in st.session_state.signal_history_log[:6]:
-                    c_log = "#ff7b72" if item["direction"] == "bearish" else "#7ee787"
-                    log_items_html += (
-                        f'<span style="background:#161b22;border:1px solid #30363d;padding:3px 10px;'
-                        f'border-radius:999px;font-size:12px;font-family:monospace;color:{c_log};">'
-                        f'🕒 <b>{item["time_str"]}</b> · {item["icon"]} {item["title"]} ({item["ticker"]})'
-                        f'</span>'
+                    c_log = "#ff7b72" if item["direction"] == "bearish" else ("#7ee787" if item["direction"] == "bullish" else "#ffcc00")
+                    log_badges.append(
+                        f'<span style="background:#161b22;border:1px solid #30363d;padding:2px 9px;border-radius:999px;font-size:11.5px;font-family:monospace;color:{c_log};">'
+                        f'🕒 <b>{item["time_str"]} PT</b> · {item["icon"]} {item["title"]} ({item["ticker"]})</span>'
                     )
                 st.markdown(
-                    f'<div style="background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:8px 14px;margin-bottom:12px;'
-                    f'display:flex;align-items:center;flex-wrap:wrap;gap:8px;">'
-                    f'<span style="color:#8b949e;font-size:12px;font-weight:700;">📜 Historial de Activaciones (HH:MM:SS):</span>'
-                    f'{log_items_html}'
-                    f'</div>',
+                    f'<div style="background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:7px 12px;margin-top:8px;display:flex;align-items:center;flex-wrap:wrap;gap:8px;">'
+                    f'<span style="color:#8b949e;font-size:11.5px;font-weight:700;">📜 Historial de Activaciones:</span>'
+                    f'{" ".join(log_badges)}</div>',
                     unsafe_allow_html=True,
                 )
+
+            # Barra de Veredicto Operativo Automático
 
             bull_pts = 0
             bear_pts = 0
@@ -1379,6 +1450,54 @@ if st.session_state.expirations:
                 else "GAMMA POSITIVA (Mercado amortiguado / Reversión a la media)"
             )
 
+            # Construir Plan Long y Plan Short respetando el orden real de los niveles
+            if p_wall < em_low < spot_now and (em_low - p_wall) > 0.05:
+                long_support_txt = f"piso diario (<b>${em_low:.2f}</b>) o Put Wall (<b>${p_wall:g}</b>)"
+            elif p_wall < spot_now:
+                long_support_txt = f"soporte/Put Wall en <b>${p_wall:g}</b>"
+            else:
+                long_support_txt = f"recuperación sobre <b>${p_wall:g}</b>"
+
+            long_targets = []
+            if abs(pin_st - c_wall) < 1e-6:
+                if c_wall > p_wall + 1e-6:
+                    long_targets.append((c_wall, f"Imán/Call Wall <b>${c_wall:g}</b>"))
+            else:
+                if pin_st > p_wall + 1e-6:
+                    long_targets.append((pin_st, f"Imán/Pin <b>${pin_st:g}</b>"))
+                if c_wall > p_wall + 1e-6:
+                    long_targets.append((c_wall, f"Call Wall <b>${c_wall:g}</b>"))
+            long_targets.sort(key=lambda item: item[0])
+
+            if len(long_targets) == 2:
+                conj = "e" if long_targets[1][1].startswith("Imán") else "y"
+                long_target_txt = f"apuntando a {long_targets[0][1]} {conj} {long_targets[1][1]}"
+            elif len(long_targets) == 1:
+                long_target_txt = f"apuntando a {long_targets[0][1]}"
+            else:
+                long_target_txt = f"apuntando al techo diario (<b>${em_high:.2f}</b>)"
+
+            plan_long_html = (
+                f"• <b>Plan Long:</b> Buscar compras si sostiene {long_support_txt} (con IV estable o bajando), "
+                f"{long_target_txt}. Evitar perseguir arriba del límite diario (<b>${em_high:.2f}</b>)."
+            )
+
+            if em_low < p_wall - 0.05:
+                plan_short_html = (
+                    f"• <b>Plan Short:</b> Si pierde el Put Wall (<b>${p_wall:g}</b>) con aumento de IV y flujo vendedor, "
+                    f"hay riesgo de aceleración rápida hacia el piso del rango esperado (<b>${em_low:.2f}</b>)."
+                )
+            elif em_low > p_wall + 0.05:
+                plan_short_html = (
+                    f"• <b>Plan Short:</b> Si pierde el piso del rango esperado (<b>${em_low:.2f}</b>) con aumento de IV y flujo vendedor, "
+                    f"hay riesgo de aceleración hacia el Put Wall (<b>${p_wall:g}</b>); perder <b>${p_wall:g}</b> abriría extensión bajista fuera del rango diario."
+                )
+            else:
+                plan_short_html = (
+                    f"• <b>Plan Short:</b> Si pierde la confluencia de Put Wall y piso diario (<b>${p_wall:g}</b>) con aumento de IV y flujo vendedor, "
+                    f"hay riesgo de extensión bajista acelerada fuera del rango esperado."
+                )
+
             verdict_html = (
                 f'<div style="background:#0b0e14;border:1.5px solid {v_border};border-radius:10px;padding:14px 18px;margin-top:14px;margin-bottom:16px;">'
                 f'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:6px;">'
@@ -1386,8 +1505,8 @@ if st.session_state.expirations:
                 f'<span style="color:#8b949e;font-size:12px;font-family:monospace;">Régimen: {gex_regime_txt}</span>'
                 f'</div>'
                 f'<div style="color:#d0d7de;font-size:13.5px;line-height:1.55;">'
-                f'• <b>Plan Long:</b> Buscar compras si sostiene soporte/Put Wall en <b>${p_wall:g}</b> (con IV estable o bajando), apuntando al Imán/Pin <b>${pin_st:g}</b> y Call Wall <b>${c_wall:g}</b>. Evitar perseguir arriba del límite diario (<b>${em_high:.2f}</b>).<br>'
-                f'• <b>Plan Short:</b> Si pierde <b>${p_wall:g}</b> con aumento de IV y flujo vendedor, hay riesgo de aceleración rápida hacia el piso del rango esperado (<b>${em_low:.2f}</b>).'
+                f'{plan_long_html}<br>'
+                f'{plan_short_html}'
                 f'</div>'
                 f'</div>'
             )
@@ -1421,6 +1540,40 @@ if st.session_state.expirations:
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 )
                 st.plotly_chart(fig_vex, use_container_width=True)
+                # Barra compacta de historial de IV ATM en la sesión
+                iv_trail_txt = "  →  ".join([f"{pt['ts'][:5]}: {pt['iv']:.1f}%" for pt in iv_hist[-6:]])
+                if len(iv_hist) == 1:
+                    spark_svg = (
+                        f'<svg width="150" height="30" viewBox="0 0 150 30">'
+                        f'<line x1="6" y1="15" x2="144" y2="15" stroke="{iv_badge_fg}" stroke-dasharray="4 4" stroke-width="1.5" opacity="0.6"/>'
+                        f'<circle cx="75" cy="15" r="3.5" fill="{iv_badge_fg}"/></svg>'
+                    )
+                else:
+                    pts_v = [pt["iv"] for pt in iv_hist[-10:]]
+                    v_min = min(pts_v) - 0.25
+                    v_max = max(pts_v) + 0.25
+                    coords = []
+                    for idx_p, val_p in enumerate(pts_v):
+                        px = 6 + (idx_p / max(len(pts_v) - 1, 1)) * 138
+                        py = 25 - ((val_p - v_min) / max(v_max - v_min, 0.01)) * 20
+                        coords.append((px, py))
+                    poly_str = " ".join([f"{x:.1f},{y:.1f}" for x, y in coords])
+                    dots_str = "".join([
+                        f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{3.5 if i == len(coords) - 1 else 2}" fill="{iv_badge_fg}"/>'
+                        for i, (x, y) in enumerate(coords)
+                    ])
+                    spark_svg = (
+                        f'<svg width="150" height="30" viewBox="0 0 150 30">'
+                        f'<polyline fill="none" stroke="{iv_badge_fg}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="{poly_str}"/>'
+                        f'{dots_str}</svg>'
+                    )
+                st.markdown(
+                    f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 14px;margin-top:6px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">'
+                    f'<div><div style="color:#ffffff;font-size:12px;font-weight:700;">Historial de IV ATM en tu sesión <span style="color:#8b949e;font-weight:400;">(con cada actualización)</span></div>'
+                    f'<div style="color:#c9d1d9;font-size:12px;font-family:monospace;margin-top:2px;">{iv_trail_txt}</div></div>'
+                    f'{spark_svg}</div>',
+                    unsafe_allow_html=True,
+                )
                 st.caption("💡 **Cómo leer VEX:** En strikes con VEX positivo (verde), una caída de la Volatilidad Implícita (IV) obliga a los dealers a **comprar subyacente** (combustible alcista). En strikes con VEX negativo (azul), una subida de IV acelera las ventas.")
 
             with tab_chex:
@@ -1451,16 +1604,39 @@ if st.session_state.expirations:
                 col_p2.metric("🧱 Call Wall (Techo Activo)", f"${c_wall:g}", f"{((c_wall - spot_now)/spot_now)*100:+.2f}% vs Spot")
                 col_p3.metric("🛡️ Put Wall (Piso Activo)", f"${p_wall:g}", f"{((p_wall - spot_now)/spot_now)*100:+.2f}% vs Spot")
                 if not tac["pin_df"].empty:
-                    pin_show = tac["pin_df"].rename(columns={
-                        "strike": "Strike",
-                        "pin_score": "Pin Score (0-100)",
-                        "dist_pct": "Distancia Spot (%)",
-                        "call_oi": "Call OI",
-                        "put_oi": "Put OI",
-                        "net_gex": "Net GEX",
-                        "role": "Rol Operativo",
-                    })
-                    st.dataframe(pin_show, use_container_width=True, hide_index=True)
+                    pin_rows_html = ""
+                    for _, pr in tac["pin_df"].iterrows():
+                        gex_v = float(pr["net_gex"])
+                        gex_clr = "#2ecc71" if gex_v > 0 else ("#ff4d4d" if gex_v < 0 else "#8b949e")
+                        dist_v = float(pr["dist_pct"])
+                        dist_clr = "#2ecc71" if dist_v >= 0 else "#ff4d4d"
+                        pin_rows_html += (
+                            f'<tr style="border-bottom:1px solid #21262d;">'
+                            f'<td style="padding:7px 8px;text-align:right;font-weight:700;color:#ffffff;">${float(pr["strike"]):g}</td>'
+                            f'<td style="padding:7px 8px;text-align:right;font-weight:700;color:#ffcc00;">{float(pr["pin_score"]):.1f}</td>'
+                            f'<td style="padding:7px 8px;text-align:right;color:{dist_clr};">{dist_v:+.2f}%</td>'
+                            f'<td style="padding:7px 8px;text-align:right;color:#c9d1d9;">{int(pr["call_oi"]):,}</td>'
+                            f'<td style="padding:7px 8px;text-align:right;color:#c9d1d9;">{int(pr["put_oi"]):,}</td>'
+                            f'<td style="padding:7px 8px;text-align:right;color:{gex_clr};font-weight:600;">{format_millions(gex_v, engine_mode)}</td>'
+                            f'<td style="padding:7px 8px;text-align:left;color:#e6edf3;white-space:nowrap;">{pr["role"]}</td>'
+                            f'</tr>'
+                        )
+                    pin_tbl_html = (
+                        '<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;overflow:hidden;margin:8px 0 10px 0;">'
+                        '<table style="width:100%;border-collapse:collapse;font-size:12.5px;font-family:\'Inter\',sans-serif;">'
+                        '<thead><tr style="background:#161b22;border-bottom:1px solid #30363d;color:#8b949e;">'
+                        '<th style="padding:8px;text-align:right;">Strike</th>'
+                        '<th style="padding:8px;text-align:right;">Pin Score</th>'
+                        '<th style="padding:8px;text-align:right;">Dist. Spot</th>'
+                        '<th style="padding:8px;text-align:right;">Call OI</th>'
+                        '<th style="padding:8px;text-align:right;">Put OI</th>'
+                        '<th style="padding:8px;text-align:right;">Net GEX</th>'
+                        '<th style="padding:8px;text-align:left;">Rol Operativo</th>'
+                        '</tr></thead>'
+                        f'<tbody>{pin_rows_html}</tbody>'
+                        '</table></div>'
+                    )
+                    st.markdown(pin_tbl_html, unsafe_allow_html=True)
                 st.caption("💡 **Pin Risk (0-100):** Combina concentración de OI (30%), cercanía al Spot (25%), peso de vencimientos cortos (25%) y magnitud Gamma (20%). Un score >65 indica fuerte atracción/freno en ese strike.")
 
             with tab_radar:
@@ -1476,18 +1652,47 @@ if st.session_state.expirations:
                 r_c3.metric("📐 Expected Move Venc. Frontal", f"±${tac['em_exp']:.2f} (±{tac['em_exp_pct']:.1f}%)", f"DTE más cercano: {tac['min_dte']} días")
 
                 if not tac["radar_df"].empty:
-                    radar_show = tac["radar_df"].rename(columns={
-                        "contract_type": "Tipo",
-                        "strike": "Strike",
-                        "dte": "DTE",
-                        "volume": "Volumen Hoy",
-                        "open_interest": "Open Interest",
-                        "vol_oi_ratio": "Ratio Vol/OI",
-                        "prem_vol_usd": "Prima Operada ($)",
-                        "delta": "Delta",
-                        "signal": "Señal de Flujo",
-                    })
-                    st.dataframe(radar_show, use_container_width=True, hide_index=True)
+                    radar_rows_html = ""
+                    for _, rr in tac["radar_df"].iterrows():
+                        ctype = str(rr["contract_type"])
+                        type_clr = "#2ecc71" if ctype == "CALL" else "#ff4d4d"
+                        type_bg = "rgba(46,204,113,0.14)" if ctype == "CALL" else "rgba(255,77,77,0.14)"
+                        ratio_v = float(rr["vol_oi_ratio"])
+                        ratio_clr = "#ffcc00" if ratio_v >= 2.0 else ("#348feb" if ratio_v >= 0.75 else "#c9d1d9")
+                        prem_v = float(rr["prem_vol_usd"])
+                        prem_txt = format_millions(prem_v, "USD") if prem_v >= 100000 else f"${prem_v:,.0f}"
+                        sig_txt = str(rr["signal"]).replace(" (CALL)", "").replace(" (PUT)", "")
+                        radar_rows_html += (
+                            f'<tr style="border-bottom:1px solid #21262d;">'
+                            f'<td style="padding:6px 6px;text-align:center;"><span style="background:{type_bg};color:{type_clr};font-weight:700;padding:2px 6px;border-radius:4px;font-size:11px;">{ctype}</span></td>'
+                            f'<td style="padding:6px 6px;text-align:right;font-weight:700;color:#ffffff;">${float(rr["strike"]):g}</td>'
+                            f'<td style="padding:6px 6px;text-align:right;color:#8b949e;">{int(rr["dte"])}d</td>'
+                            f'<td style="padding:6px 6px;text-align:right;color:#e6edf3;font-weight:600;">{int(rr["volume"]):,}</td>'
+                            f'<td style="padding:6px 6px;text-align:right;color:#c9d1d9;">{int(rr["open_interest"]):,}</td>'
+                            f'<td style="padding:6px 6px;text-align:right;color:{ratio_clr};font-weight:700;">{ratio_v:.2f}x</td>'
+                            f'<td style="padding:6px 6px;text-align:right;color:#e6edf3;font-weight:600;">{prem_txt}</td>'
+                            f'<td style="padding:6px 6px;text-align:right;color:#8b949e;">{float(rr["delta"]):.2f}</td>'
+                            f'<td style="padding:6px 6px;text-align:left;color:#e6edf3;white-space:nowrap;">{sig_txt}</td>'
+                            f'</tr>'
+                        )
+                    radar_tbl_html = (
+                        '<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;overflow:hidden;margin:8px 0 10px 0;">'
+                        '<table style="width:100%;border-collapse:collapse;font-size:12px;font-family:\'Inter\',sans-serif;">'
+                        '<thead><tr style="background:#161b22;border-bottom:1px solid #30363d;color:#8b949e;">'
+                        '<th style="padding:7px 6px;text-align:center;">Tipo</th>'
+                        '<th style="padding:7px 6px;text-align:right;">Strike</th>'
+                        '<th style="padding:7px 6px;text-align:right;">DTE</th>'
+                        '<th style="padding:7px 6px;text-align:right;">Vol</th>'
+                        '<th style="padding:7px 6px;text-align:right;">OI</th>'
+                        '<th style="padding:7px 6px;text-align:right;">Vol/OI</th>'
+                        '<th style="padding:7px 6px;text-align:right;">Prima ($)</th>'
+                        '<th style="padding:7px 6px;text-align:right;">Delta</th>'
+                        '<th style="padding:7px 6px;text-align:left;">Señal</th>'
+                        '</tr></thead>'
+                        f'<tbody>{radar_rows_html}</tbody>'
+                        '</table></div>'
+                    )
+                    st.markdown(radar_tbl_html, unsafe_allow_html=True)
                 st.caption("💡 **Cómo detectar entradas institucionales:** Cuando el **Ratio Vol/OI es > 1.0x** (y especialmente > 2.0x, marcado con 🔥), significa que están entrando contratos nuevos agresivos hoy que superan todo lo que había abierto antes.")
 
             # Fila 5: Gráficas de Exposición Verticales con Filtro de Rango Dinámico

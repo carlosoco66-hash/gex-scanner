@@ -3,6 +3,79 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import datetime
+import math
+
+
+def _norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _inv_norm_cdf(p):
+    """Aproximación de Acklam para inversa de la normal estándar (0 < p < 1)."""
+    if p <= 0.0 or p >= 1.0:
+        return 0.0
+    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
+    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+         6.680131188771972e+01, -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
+    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+         3.754408661907416e+00]
+    plow = 0.02425
+    phigh = 1.0 - plow
+    if p < plow:
+        q = math.sqrt(-2.0 * math.log(p))
+        return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1.0)
+    if p <= phigh:
+        q = p - 0.5
+        r = q * q
+        return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q / (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1.0)
+    q = math.sqrt(-2.0 * math.log(1.0 - p))
+    return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1.0)
+
+
+def _solve_iv_from_price(price, spot, strike, T, opt_type, rate=0.045):
+    """Resuelve la IV real por bisección de Black-Scholes desde el precio en vivo de la opción."""
+    if price <= 0.005 or spot <= 0 or strike <= 0 or T <= 0:
+        return 0.0
+    disc_k = strike * math.exp(-rate * T)
+    intrinsic = max(spot - disc_k, 0.0) if opt_type == 'C' else max(disc_k - spot, 0.0)
+    if price <= intrinsic + 0.005:
+        return 0.0
+
+    lo, hi = 0.02, 3.50
+    sqrt_T = math.sqrt(T)
+    for _ in range(28):
+        mid = 0.5 * (lo + hi)
+        d1 = (math.log(spot / strike) + (rate + 0.5 * mid * mid) * T) / (mid * sqrt_T)
+        d2 = d1 - mid * sqrt_T
+        if opt_type == 'C':
+            bs_val = spot * _norm_cdf(d1) - disc_k * _norm_cdf(d2)
+        else:
+            bs_val = disc_k * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
+        if bs_val > price:
+            hi = mid
+        else:
+            lo = mid
+    iv_res = 0.5 * (lo + hi)
+    return iv_res if 0.025 < iv_res < 3.45 else 0.0
+
+
+def _solve_iv_from_greeks(gamma, delta, spot, T, opt_type):
+    """Estima IV real invirtiendo Gamma y Delta en vivo de Black-Scholes."""
+    if gamma <= 1e-6 or spot <= 0 or T <= 0:
+        return 0.0
+    c_delta = delta if opt_type == 'C' else (delta + 1.0)
+    if c_delta <= 0.12 or c_delta >= 0.88:
+        return 0.0
+    try:
+        d1 = _inv_norm_cdf(c_delta)
+        pdf_d1 = math.exp(-0.5 * d1 * d1) / math.sqrt(2.0 * math.pi)
+        iv_est = pdf_d1 / (spot * gamma * math.sqrt(T))
+        return iv_est if 0.04 <= iv_est <= 3.0 else 0.0
+    except Exception:
+        return 0.0
 
 def get_live_spot_price(ticker):
     """Obtiene el precio spot en tiempo real usando yfinance."""
@@ -95,9 +168,11 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
             df_raw['open_interest'] = df_raw['open_interest'].fillna(0.0).astype(float)
             df_raw['volume'] = df_raw['volume'].fillna(0.0).astype(float)
             
-            # Extraer precio de la opción si viene en FlashAlpha (mid, last, mark, price o promedio bid/ask)
+            # Extraer precio de la opción si viene en FlashAlpha (mid, mark, last, price o promedio bid/ask)
             if 'mid' in df_raw.columns:
                 df_raw['opt_price'] = pd.to_numeric(df_raw['mid'], errors='coerce').fillna(0.0)
+            elif 'mark' in df_raw.columns:
+                df_raw['opt_price'] = pd.to_numeric(df_raw['mark'], errors='coerce').fillna(0.0)
             elif 'last' in df_raw.columns:
                 df_raw['opt_price'] = pd.to_numeric(df_raw['last'], errors='coerce').fillna(0.0)
             elif 'price' in df_raw.columns:
@@ -108,15 +183,69 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
                 df_raw['opt_price'] = (b + a) / 2.0
             else:
                 df_raw['opt_price'] = 0.0
-                
-            if 'iv' in df_raw.columns and 'implied_volatility' not in df_raw.columns:
-                iv_col = pd.to_numeric(df_raw['iv'], errors='coerce').fillna(0.0)
-                df_raw['implied_volatility'] = iv_col.apply(lambda v: v / 100.0 if v > 3.0 else v)
-            elif 'implied_volatility' in df_raw.columns:
-                iv_col = pd.to_numeric(df_raw['implied_volatility'], errors='coerce').fillna(0.0)
-                df_raw['implied_volatility'] = iv_col.apply(lambda v: v / 100.0 if v > 3.0 else v)
-            else:
-                df_raw['implied_volatility'] = 0.20
+
+            # 1) Buscar IV directa en cualquiera de los campos que pueda devolver FlashAlpha
+            iv_found = False
+            for iv_key in ('iv', 'implied_volatility', 'impliedVolatility', 'mid_iv', 'mark_iv', 'volatility', 'imp_vol', 'theo_iv'):
+                if iv_key in df_raw.columns:
+                    iv_col = pd.to_numeric(df_raw[iv_key], errors='coerce').fillna(0.0)
+                    iv_norm = iv_col.apply(lambda v: v / 100.0 if v > 3.0 else v)
+                    if (iv_norm > 0.01).any():
+                        df_raw['implied_volatility'] = iv_norm
+                        iv_found = True
+                        break
+
+            # 2) Si FlashAlpha no trajo IV directa, calcular IV real en vivo desde opt_price o gamma/delta
+            if not iv_found:
+                inferred_ivs = []
+                for _, r in df_raw.iterrows():
+                    k_val = float(r.get('strike', 0.0) or 0.0)
+                    dte_val = float(r.get('dte', 0.0) or 0.0)
+                    T_iv = max(dte_val, 0.25) / 365.0
+                    opt_t = r.get('type', 'C')
+                    p_val = float(r.get('opt_price', 0.0) or 0.0)
+                    iv_calc = 0.0
+                    if spot > 0 and k_val > 0 and abs(k_val - spot) / spot <= 0.25:
+                        if p_val > 0:
+                            iv_calc = _solve_iv_from_price(p_val, spot, k_val, T_iv, opt_t)
+                        if iv_calc <= 0:
+                            g_val = float(r.get('gamma', 0.0) or 0.0)
+                            d_val = float(r.get('delta', 0.0) or 0.0)
+                            iv_calc = _solve_iv_from_greeks(g_val, d_val, spot, T_iv, opt_t)
+                    inferred_ivs.append(iv_calc)
+                df_raw['implied_volatility'] = inferred_ivs
+
+                # Completar filas sin IV válida con la mediana ATM de su vencimiento (o global)
+                valid_mask = (df_raw['implied_volatility'] > 0.02) & (df_raw['implied_volatility'] < 3.5)
+                if valid_mask.any():
+                    df_valid = df_raw[valid_mask].copy()
+                    df_valid['dist_s'] = (df_valid['strike'] - spot).abs()
+                    exp_meds = {}
+                    for exp_k, grp in df_valid.groupby('expiry'):
+                        exp_meds[exp_k] = float(grp.nsmallest(6, 'dist_s')['implied_volatility'].median())
+                    global_med = float(df_valid.nsmallest(8, 'dist_s')['implied_volatility'].median())
+                    df_raw['implied_volatility'] = df_raw.apply(
+                        lambda r: r['implied_volatility']
+                        if 0.02 < float(r['implied_volatility']) < 3.5
+                        else exp_meds.get(r['expiry'], global_med),
+                        axis=1,
+                    )
+                else:
+                    # 3) Respaldo ligero a yfinance solo para obtener IV real si no hubo precio ni gamma válida
+                    yf_iv_med = 0.0
+                    try:
+                        t_yf = yf.Ticker(ticker.upper())
+                        exps_avail = selected_expirations if selected_expirations else list(t_yf.options[:1])
+                        if exps_avail:
+                            ch = t_yf.option_chain(exps_avail[0])
+                            df_ch = pd.concat([ch.calls, ch.puts], ignore_index=True)
+                            df_ch = df_ch[(df_ch['impliedVolatility'] > 0.02) & (df_ch['impliedVolatility'] < 3.5)].copy()
+                            if not df_ch.empty:
+                                df_ch['dist_s'] = (df_ch['strike'] - spot).abs()
+                                yf_iv_med = float(df_ch.nsmallest(6, 'dist_s')['impliedVolatility'].median())
+                    except Exception:
+                        pass
+                    df_raw['implied_volatility'] = yf_iv_med if yf_iv_med > 0.02 else 0.20
     except Exception as e:
         print(f"Error fetching option_quote: {e}")
         
@@ -513,11 +642,25 @@ def fetch_live_flow(ticker, api_key):
         err_msg = f"Error en Flow GEX: {e}"
         result["error"] = f"{result['error']} | {err_msg}" if result["error"] else err_msg
 
-    # VEX, CHEX, Levels y Pin Risk se calculan localmente sobre option_quote / flow_gex para ahorrar cuota (0 requests extra)
-    result["levels"] = {}
-    result["pin_risk"] = {}
-    result["vex_api"] = {}
-    result["chex_api"] = {}
+    try:
+        result["levels"] = _flashalpha_get(f"/v1/flow/levels/{ticker}", api_key)
+    except Exception:
+        pass
+
+    try:
+        result["pin_risk"] = _flashalpha_get(f"/v1/flow/pin-risk/{ticker}", api_key)
+    except Exception:
+        result["pin_risk"] = {}
+
+    try:
+        result["vex_api"] = _flashalpha_get(f"/v1/exposure/vex/{ticker}", api_key)
+    except Exception:
+        result["vex_api"] = {}
+
+    try:
+        result["chex_api"] = _flashalpha_get(f"/v1/exposure/chex/{ticker}", api_key)
+    except Exception:
+        result["chex_api"] = {}
 
     return result
 
@@ -553,33 +696,10 @@ def calculate_tactical_metrics(df_gex, df_raw, spot, live_flow=None):
         "radar_df": pd.DataFrame(),
         "total_call_prem_vol": 0.0,
         "total_put_prem_vol": 0.0,
-        "total_call_prem_oi": 0.0,
-        "total_put_prem_oi": 0.0,
-        "spot_change_pct": 0.0,
-        "iv_rising": False,
-        "front_iv": 0.25,
-        "back_iv": 0.25,
     }
 
     if df_gex.empty or spot <= 0:
         return tactical
-
-    # 0. Variación porcentual del Spot vs cierre previo (yfinance / live_flow)
-    try:
-        lf_sum = live_flow.get("summary") or {}
-        lf_gex = live_flow.get("gex") or {}
-        pct_api = lf_sum.get("underlying_change_pct") or lf_gex.get("underlying_change_pct") or lf_sum.get("price_change_pct")
-        if pct_api is not None:
-            tactical["spot_change_pct"] = float(pct_api)
-        else:
-            ticker_sym = lf_sum.get("symbol") or lf_gex.get("symbol")
-            if ticker_sym:
-                t_info = yf.Ticker(str(ticker_sym).upper()).fast_info
-                prev_c = float(t_info.get("previousClose") or t_info.get("regularMarketPreviousClose") or 0.0)
-                if prev_c > 0:
-                    tactical["spot_change_pct"] = ((spot - prev_c) / prev_c) * 100.0
-    except Exception:
-        pass
 
     # 1. VEX y CHEX totales (priorizando el cálculo sobre las expiraciones activas)
     net_vex = float(df_gex["net_vex"].sum()) if "net_vex" in df_gex.columns else 0.0
@@ -611,14 +731,6 @@ def calculate_tactical_metrics(df_gex, df_raw, spot, live_flow=None):
                 iv_mean = float(atm_rows["implied_volatility"].mean())
                 if iv_mean > 0:
                     atm_iv = iv_mean
-                # Comparar IV de puts vs calls cerca de ATM o estructura temporal para detectar presión de IV al alza
-                put_atm = atm_rows[atm_rows["type"] == "P"]["implied_volatility"]
-                call_atm = atm_rows[atm_rows["type"] == "C"]["implied_volatility"]
-                p_iv = float(put_atm.mean()) if not put_atm.empty else atm_iv
-                c_iv = float(call_atm.mean()) if not call_atm.empty else atm_iv
-                tactical["front_iv"] = p_iv
-                tactical["back_iv"] = c_iv
-                tactical["iv_rising"] = bool(p_iv >= c_iv)
 
     em_1d = spot * atm_iv * math.sqrt(1.0 / 252.0)
     em_1d_pct = (em_1d / spot) * 100.0 if spot > 0 else 0.0
@@ -717,22 +829,21 @@ def calculate_tactical_metrics(df_gex, df_raw, spot, live_flow=None):
     else:
         pin_strike = spot
         pin_score = 0.0
-
-    # Si FlashAlpha devolvió pin_risk directo de la API, respetar si trae score/strike válido
-    pr_api = live_flow.get("pin_risk") or {}
-    if isinstance(pr_api, dict):
-        api_ps = pr_api.get("pin_score") or pr_api.get("score")
-        api_st = pr_api.get("pin_strike") or pr_api.get("magnet_strike") or pr_api.get("strike")
-        if api_ps is not None:
-            try:
-                pin_score = float(api_ps)
-            except Exception:
-                pass
-        if api_st is not None:
-            try:
-                pin_strike = float(api_st)
-            except Exception:
-                pass
+        # Solo usar pin_risk de FlashAlpha como respaldo si la tabla local está vacía
+        pr_api = live_flow.get("pin_risk") or {}
+        if isinstance(pr_api, dict):
+            api_st = pr_api.get("pin_strike") or pr_api.get("magnet_strike") or pr_api.get("strike")
+            api_ps = pr_api.get("pin_score") or pr_api.get("score")
+            if api_st is not None:
+                try:
+                    pin_strike = float(api_st)
+                except Exception:
+                    pass
+            if api_ps is not None:
+                try:
+                    pin_score = float(api_ps)
+                except Exception:
+                    pass
 
     if pin_score >= 65:
         pin_label = "ALTO"
@@ -761,23 +872,19 @@ def calculate_tactical_metrics(df_gex, df_raw, spot, live_flow=None):
         df_r["prem_vol_usd"] = df_r["volume"] * df_r["opt_price"] * 100.0
         tactical["total_call_prem_vol"] = float(df_r[df_r["type"] == "C"]["prem_vol_usd"].sum())
         tactical["total_put_prem_vol"] = float(df_r[df_r["type"] == "P"]["prem_vol_usd"].sum())
-        if "call_prem_oi" in df_r.columns and "put_prem_oi" in df_r.columns:
-            tactical["total_call_prem_oi"] = float(df_r["call_prem_oi"].sum())
-            tactical["total_put_prem_oi"] = float(df_r["put_prem_oi"].sum())
 
         def classify_signal(r):
             vol = float(r.get("volume", 0) or 0)
             ratio = float(r.get("vol_oi_ratio", 0) or 0)
-            ctype = r.get("contract_type", "CALL")
             if vol <= 0:
-                return "⏸️ Sin Volumen Hoy"
+                return "⏸️ Sin Volumen"
             if ratio >= 2.0:
-                return f"🔥 Apertura Masiva ({ctype})"
+                return "🔥 Apertura Masiva"
             if ratio >= 0.75:
-                return f"⚡ Flujo Activo Nuevo ({ctype})"
+                return "⚡ Flujo Activo"
             if ratio >= 0.25:
-                return f"📈 Rotación Moderada ({ctype})"
-            return "🏛️ Posición Estructural (OI)"
+                return "📈 Rotación Mod."
+            return "🏛️ Posición OI"
 
         df_r["signal"] = df_r.apply(classify_signal, axis=1)
         df_r["sort_key"] = df_r["prem_vol_usd"] + df_r["open_interest"] * 10.0
