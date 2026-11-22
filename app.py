@@ -1122,24 +1122,47 @@ if st.session_state.expirations:
                     sc["activated_at"] = None
                     sc["last_activated_at"] = last_t
 
-            # Barra de control de Audio (Silbato Festivo + Sirena + Voz en Español)
+            # Código de 1-Clic para copiar y pegar directo en el indicador de TradingView (Pine Script)
+            gex_code_num = 1 if tot_gex_now >= 0 else -1
+            vex_code_num = 1 if net_vex_val >= 0 else -1
+            chex_code_num = 1 if net_chex_val >= 0 else -1
+            gamma_flip_val = float(res.get("Zero GEX (Balance)", spot_now) or spot_now)
+            tv_one_click_code = (
+                f"FLIP={gamma_flip_val:.2f}|CW={c_wall:.2f}|PW={p_wall:.2f}|PIN={pin_st:.2f}|"
+                f"SCORE={pin_sc:.0f}|GEX={gex_code_num}|VEX={vex_code_num}|CHEX={chex_code_num}|"
+                f"CALLS={call_share_sq:.0f}|PUTS={put_share_sq:.0f}|EMH={em_high:.2f}|EML={em_low:.2f}"
+            )
+
+            # Barra de control de Audio (Silbato Festivo + Sirena + Voz en Español) + Copiar a TradingView en 1 Clic
             triggered_json = json.dumps(newly_triggered_signals)
+            tv_code_json = json.dumps(tv_one_click_code)
             audio_component_html = f"""
             <style>body {{ margin: 0; padding: 0; background: transparent; }}</style>
-            <div style="background:#11161f;border:1px solid #283040;border-radius:10px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;font-family:'Inter',sans-serif;">
-                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                    <span style="color:#e6edf3;font-size:13px;font-weight:700;">🔊 Radar de 4 Señales y Alarmas ({ticker}):</span>
-                    <span id="audio_status_badge" style="background:#132a1c;border:1px solid #2ecc71;color:#2ecc71;font-size:11px;font-weight:700;padding:2px 9px;border-radius:999px;">AUDIO + VOZ ACTIVOS</span>
+            <div style="background:#11161f;border:1px solid #283040;border-radius:10px;padding:10px 14px;display:flex;flex-direction:column;gap:8px;font-family:'Inter',sans-serif;">
+                <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+                    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                        <span style="color:#e6edf3;font-size:13px;font-weight:700;">🔊 Radar de 4 Señales y Alarmas ({ticker}):</span>
+                        <span id="audio_status_badge" style="background:#132a1c;border:1px solid #2ecc71;color:#2ecc71;font-size:11px;font-weight:700;padding:2px 9px;border-radius:999px;">AUDIO + VOZ ACTIVOS</span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                        <button onclick="testWhistleAlert()" style="background:#132f20;border:1px solid #2ecc71;color:#7ee787;padding:5px 11px;border-radius:7px;font-size:11.5px;font-weight:700;cursor:pointer;">
+                            🎉 Probar Silbato + Voz (Subida)
+                        </button>
+                        <button onclick="testSirenAlert()" style="background:#341417;border:1px solid #ff4d4d;color:#ff7b72;padding:5px 11px;border-radius:7px;font-size:11.5px;font-weight:700;cursor:pointer;">
+                            🚨 Probar Sirena + Voz (Caída)
+                        </button>
+                        <button id="mute_btn" onclick="toggleMute()" style="background:#1c212b;border:1px solid #3a4252;color:#c9d1d9;padding:5px 11px;border-radius:7px;font-size:11.5px;font-weight:600;cursor:pointer;">
+                            🔇 Silenciar
+                        </button>
+                    </div>
                 </div>
-                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                    <button onclick="testWhistleAlert()" style="background:#132f20;border:1px solid #2ecc71;color:#7ee787;padding:5px 11px;border-radius:7px;font-size:11.5px;font-weight:700;cursor:pointer;">
-                        🎉 Probar Silbato + Voz (Subida)
-                    </button>
-                    <button onclick="testSirenAlert()" style="background:#341417;border:1px solid #ff4d4d;color:#ff7b72;padding:5px 11px;border-radius:7px;font-size:11.5px;font-weight:700;cursor:pointer;">
-                        🚨 Probar Sirena + Voz (Caída)
-                    </button>
-                    <button id="mute_btn" onclick="toggleMute()" style="background:#1c212b;border:1px solid #3a4252;color:#c9d1d9;padding:5px 11px;border-radius:7px;font-size:11.5px;font-weight:600;cursor:pointer;">
-                        🔇 Silenciar
+                <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;background:#0b0e14;border:1px solid #21262d;border-radius:8px;padding:6px 10px;">
+                    <div style="display:flex;align-items:center;gap:8px;flex:1;min-width:240px;">
+                        <span style="color:#58a6ff;font-size:12px;font-weight:700;white-space:nowrap;">📺 TradingView (1 Clic):</span>
+                        <input id="tv_code_input" type="text" readonly value="{tv_one_click_code}" onclick="this.select();" style="background:#161b22;border:1px solid #30363d;color:#c9d1d9;font-family:monospace;font-size:11.5px;padding:4px 8px;border-radius:5px;width:100%;outline:none;" />
+                    </div>
+                    <button id="copy_tv_btn" onclick="copyTvCode()" style="background:#1f3a5f;border:1px solid #388bfd;color:#79c0ff;padding:5px 12px;border-radius:7px;font-size:11.5px;font-weight:700;cursor:pointer;white-space:nowrap;">
+                        📋 Copiar para TradingView
                     </button>
                 </div>
             </div>
@@ -1309,6 +1332,35 @@ if st.session_state.expirations:
                     }});
                 }};
 
+                window.copyTvCode = function() {{
+                    const codeStr = {tv_code_json};
+                    const btn = document.getElementById('copy_tv_btn');
+                    const inp = document.getElementById('tv_code_input');
+                    try {{
+                        if (inp) {{
+                            inp.select();
+                            inp.setSelectionRange(0, 99999);
+                        }}
+                        if (navigator.clipboard && navigator.clipboard.writeText) {{
+                            navigator.clipboard.writeText(codeStr);
+                        }} else {{
+                            document.execCommand('copy');
+                        }}
+                        btn.textContent = '✅ ¡Copiado! Pégalo en TradingView';
+                        btn.style.background = '#132f20';
+                        btn.style.borderColor = '#2ecc71';
+                        btn.style.color = '#7ee787';
+                        setTimeout(() => {{
+                            btn.textContent = '📋 Copiar para TradingView';
+                            btn.style.background = '#1f3a5f';
+                            btn.style.borderColor = '#388bfd';
+                            btn.style.color = '#79c0ff';
+                        }}, 3000);
+                    }} catch (e) {{
+                        document.execCommand('copy');
+                    }}
+                }};
+
                 const newlyTriggered = {triggered_json};
                 if (newlyTriggered && newlyTriggered.length > 0 && !isMuted) {{
                     const firstSig = newlyTriggered[0];
@@ -1330,7 +1382,7 @@ if st.session_state.expirations:
             }})();
             </script>
             """
-            components.html(audio_component_html, height=88, scrolling=False)
+            components.html(audio_component_html, height=118, scrolling=False)
 
             # Renderizar las 4 Opciones Simultáneamente en un Grid 2x2
             sq_col1, sq_col2 = st.columns(2)
