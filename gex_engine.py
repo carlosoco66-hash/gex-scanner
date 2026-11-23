@@ -91,6 +91,41 @@ def get_live_spot_price(ticker):
         print(f"Error fetching yfinance spot for {ticker}: {e}")
     return 0.0
 
+def get_hv_and_gap_context(ticker):
+    """Obtiene Volatilidad Histórica (HV 20d), cierre previo y apertura del día con yfinance."""
+    out = {"hv_20d": 0.0, "prev_close": 0.0, "today_open": 0.0}
+    try:
+        t = yf.Ticker(ticker.upper())
+        hist = t.history(period="2mo", interval="1d")
+        if hist is not None and not hist.empty and "Close" in hist.columns:
+            closes = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+            if len(closes) >= 6:
+                log_ret = np.log(closes / closes.shift(1)).dropna().tail(20)
+                if len(log_ret) >= 5:
+                    out["hv_20d"] = float(log_ret.std() * math.sqrt(252.0) * 100.0)
+            today_d = datetime.date.today()
+            last_idx_d = hist.index[-1].date() if hasattr(hist.index[-1], "date") else None
+            if last_idx_d == today_d and len(closes) >= 2:
+                out["prev_close"] = float(closes.iloc[-2])
+                out["today_open"] = float(pd.to_numeric(hist["Open"].iloc[-1], errors="coerce") or 0.0)
+            elif len(closes) >= 1:
+                out["prev_close"] = float(closes.iloc[-1])
+                out["today_open"] = float(pd.to_numeric(hist["Open"].iloc[-1], errors="coerce") or 0.0)
+        try:
+            fi = t.fast_info
+            pc = fi.get("previousClose") or fi.get("regularMarketPreviousClose")
+            op = fi.get("open")
+            if pc and float(pc) > 0:
+                out["prev_close"] = float(pc)
+            if op and float(op) > 0:
+                out["today_open"] = float(op)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"Error fetching HV/gap context for {ticker}: {e}")
+    return out
+
+
 def get_options_expirations(ticker, api_key):
     """Obtiene la lista de fechas de expiración disponibles usando FlashAlpha."""
     try:
@@ -745,6 +780,36 @@ def calculate_tactical_metrics(df_gex, df_raw, spot, live_flow=None):
     tactical["em_exp"] = em_exp
     tactical["em_exp_pct"] = em_exp_pct
     tactical["min_dte"] = min_dte
+
+    # 2b. IV Skew OTM (Calls OTM vs Puts OTM) y Liquidez cerca del Spot (±10%)
+    call_otm_iv_pct = atm_iv * 100.0
+    put_otm_iv_pct = atm_iv * 100.0
+    if not df_raw.empty and "implied_volatility" in df_raw.columns and "type" in df_raw.columns:
+        df_sk = df_raw[(df_raw["implied_volatility"] > 0.02) & (df_raw["implied_volatility"] < 3.5)].copy()
+        if not df_sk.empty:
+            c_otm = df_sk[(df_sk["type"] == "C") & (df_sk["strike"] > spot * 1.005) & (df_sk["strike"] <= spot * 1.12)].copy()
+            if c_otm.empty:
+                c_otm = df_sk[(df_sk["type"] == "C") & (df_sk["strike"] > spot)].copy()
+            if not c_otm.empty:
+                c_otm["dist_t"] = (c_otm["strike"] - spot * 1.035).abs()
+                call_otm_iv_pct = float(c_otm.nsmallest(4, "dist_t")["implied_volatility"].median() * 100.0)
+
+            p_otm = df_sk[(df_sk["type"] == "P") & (df_sk["strike"] < spot * 0.995) & (df_sk["strike"] >= spot * 0.88)].copy()
+            if p_otm.empty:
+                p_otm = df_sk[(df_sk["type"] == "P") & (df_sk["strike"] < spot)].copy()
+            if not p_otm.empty:
+                p_otm["dist_t"] = (p_otm["strike"] - spot * 0.965).abs()
+                put_otm_iv_pct = float(p_otm.nsmallest(4, "dist_t")["implied_volatility"].median() * 100.0)
+
+    df_liq = df_gex[(df_gex["strike"] >= spot * 0.90) & (df_gex["strike"] <= spot * 1.10)]
+    near_oi_10 = int(df_liq["open_interest"].sum()) if ("open_interest" in df_liq.columns and not df_liq.empty) else 0
+    near_vol_10 = int(df_liq["volume"].sum()) if ("volume" in df_liq.columns and not df_liq.empty) else 0
+
+    tactical["call_otm_iv_pct"] = call_otm_iv_pct
+    tactical["put_otm_iv_pct"] = put_otm_iv_pct
+    tactical["iv_skew_pct"] = call_otm_iv_pct - put_otm_iv_pct
+    tactical["near_oi_10"] = near_oi_10
+    tactical["near_vol_10"] = near_vol_10
 
     # 3. Call Wall, Put Wall y Pin Risk Score (0-100) por Strike
     df_near = df_gex[(df_gex["strike"] >= spot * 0.75) & (df_gex["strike"] <= spot * 1.25)].copy()

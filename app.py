@@ -59,8 +59,17 @@ def _fallback_tactical_metrics(df_gex, df_raw, spot, live_flow=None):
 
 
 calculate_tactical_metrics = getattr(gex_engine, "calculate_tactical_metrics", _fallback_tactical_metrics)
+get_hv_and_gap_context = getattr(
+    gex_engine,
+    "get_hv_and_gap_context",
+    lambda ticker: {"hv_20d": 0.0, "prev_close": 0.0, "today_open": 0.0},
+)
 
 # Funciones con caché para optimizar consultas de la API (60s para datos en vivo)
+@st.cache_data(ttl=1800)
+def cached_hv_and_gap_context(ticker):
+    return get_hv_and_gap_context(ticker)
+
 @st.cache_data(ttl=300)
 def cached_options_expirations(ticker, api_key):
     return get_options_expirations(ticker, api_key)
@@ -961,6 +970,175 @@ if st.session_state.expirations:
                     f'</div>',
                     unsafe_allow_html=True,
                 )
+
+            # Contexto Institucional en Vivo (6 filtros separados en 3x2 — lee directo de la misma descarga FlashAlpha)
+            hv_ctx = cached_hv_and_gap_context(ticker)
+            hv_20d = float(hv_ctx.get("hv_20d", 0.0) or 0.0)
+            prev_close_val = float(hv_ctx.get("prev_close", 0.0) or 0.0)
+            today_open_val = float(hv_ctx.get("today_open", 0.0) or 0.0)
+
+            # 1) IV Skew (OTM)
+            c_otm_iv = float(tac.get("call_otm_iv_pct", atm_iv_pct))
+            p_otm_iv = float(tac.get("put_otm_iv_pct", atm_iv_pct))
+            skew_diff = float(tac.get("iv_skew_pct", c_otm_iv - p_otm_iv))
+            if skew_diff >= 2.0:
+                sk_pill, sk_clr = "CALL SKEW", "#2ecc71"
+                sk_val = f"Calls +{skew_diff:.1f}% vs Puts"
+                sk_sub = f"Call OTM {c_otm_iv:.1f}% vs Put OTM {p_otm_iv:.1f}% · FOMO alcista"
+            elif skew_diff <= -2.0:
+                sk_pill, sk_clr = "PUT SKEW", "#ff4d4d"
+                sk_val = f"Puts +{abs(skew_diff):.1f}% vs Calls"
+                sk_sub = f"Put OTM {p_otm_iv:.1f}% vs Call OTM {c_otm_iv:.1f}% · Miedo / cobertura"
+            else:
+                sk_pill, sk_clr = "NEUTRO", "#8b949e"
+                sk_val = f"Dif. {skew_diff:+.1f}% (OTM)"
+                sk_sub = f"Call {c_otm_iv:.1f}% vs Put {p_otm_iv:.1f}% · Sin sesgo extremo"
+
+            # 2) IV vs HV 20d
+            if hv_20d > 1.0:
+                iv_hv_ratio = atm_iv_pct / hv_20d
+                if iv_hv_ratio >= 1.15:
+                    ih_pill, ih_clr = "CARAS", "#ff4d4d"
+                    ih_sub = f"Ratio {iv_hv_ratio:.2f}x · Cuidado con IV crush al comprar"
+                elif iv_hv_ratio <= 0.90:
+                    ih_pill, ih_clr = "BARATAS", "#2ecc71"
+                    ih_sub = f"Ratio {iv_hv_ratio:.2f}x · Buena relación para ruptura"
+                else:
+                    ih_pill, ih_clr = "JUSTAS", "#ffcc00"
+                    ih_sub = f"Ratio {iv_hv_ratio:.2f}x · Prima en valor justo"
+                ih_val = f"IV {atm_iv_pct:.1f}% vs HV {hv_20d:.1f}%"
+            else:
+                ih_pill, ih_clr = "N/D", "#8b949e"
+                ih_val = f"IV {atm_iv_pct:.1f}% (sin HV)"
+                ih_sub = "Historial diario insuficiente para HV 20d"
+
+            # 3) Proximidad & Cruce del Gamma Flip
+            g_flip_val = float(res.get("Gamma Flip") or res.get("Zero GEX (Balance)") or 0.0)
+            if g_flip_val > 0 and spot_now > 0:
+                dist_flip = ((spot_now - g_flip_val) / g_flip_val) * 100.0
+                sp_prev_f = float(iv_hist[-2].get("spot", spot_now)) if len(iv_hist) >= 2 else spot_now
+                if len(iv_hist) >= 2 and sp_prev_f < g_flip_val <= spot_now:
+                    fl_pill, fl_clr = "CRUCE ▲", "#2ecc71"
+                    fl_sub = "Spot acaba de cruzar arriba → pasa a Gamma+"
+                elif len(iv_hist) >= 2 and sp_prev_f > g_flip_val >= spot_now:
+                    fl_pill, fl_clr = "CRUCE ▼", "#ff4d4d"
+                    fl_sub = "Spot perdió el Flip → pasa a Gamma− acelerada"
+                elif abs(dist_flip) <= 0.6:
+                    fl_pill, fl_clr = "EN ZONA", "#ffcc00"
+                    fl_sub = f"A solo {abs(dist_flip):.2f}% del Flip · Pivote de régimen"
+                elif spot_now > g_flip_val:
+                    fl_pill, fl_clr = "ARRIBA (+)", "#2ecc71"
+                    fl_sub = "Arriba del Flip · Gamma+ amortiguada"
+                else:
+                    fl_pill, fl_clr = "BAJO FLIP", "#ff4d4d"
+                    fl_sub = "Debajo del Flip · Gamma− movimientos rápidos"
+                fl_val = f"${g_flip_val:.2f} ({dist_flip:+.2f}%)"
+            else:
+                fl_pill, fl_clr = "N/D", "#8b949e"
+                fl_val = "Sin Gamma Flip"
+                fl_sub = "No hay cruce de Gamma en el rango actual"
+
+            # 4) Gap de Apertura & % de Expected Move usado
+            if prev_close_val > 0 and em_1d > 0:
+                day_move_abs = abs(spot_now - prev_close_val)
+                em_used = (day_move_abs / em_1d) * 100.0
+                gap_ref = today_open_val if today_open_val > 0 else spot_now
+                gap_pct = ((gap_ref - prev_close_val) / prev_close_val) * 100.0
+                outside_walls = (c_wall > 0 and spot_now > c_wall) or (p_wall > 0 and spot_now < p_wall)
+                if outside_walls:
+                    em_pill, em_clr = "UNPIN", "#ff8c00"
+                    em_sub = "Spot fuera de muros · Posible re-hedge fuerte"
+                elif em_used >= 75.0:
+                    em_pill, em_clr = "EXTENDIDO", "#ffcc00"
+                    em_sub = "Gran parte del rango diario ya recorrido · No perseguir"
+                else:
+                    em_pill, em_clr = "EN RANGO", "#2ecc71"
+                    em_sub = "Aún queda recorrido disponible dentro del Expected Move"
+                em_val = f"{em_used:.0f}% EM usado · Gap {gap_pct:+.1f}%"
+            else:
+                em_pill, em_clr = "N/D", "#8b949e"
+                em_val = "Sin cierre previo"
+                em_sub = f"Expected Move diario: ±${em_1d:.2f}"
+
+            # 5) Semáforo de Liquidez de Opciones (±10% del Spot)
+            n_oi = int(tac.get("near_oi_10", 0) or 0)
+            n_vol = int(tac.get("near_vol_10", 0) or 0)
+            oi_str = f"{n_oi/1000:.1f}K" if n_oi >= 1000 else f"{n_oi:,}"
+            vol_str = f"{n_vol/1000:.1f}K" if n_vol >= 1000 else f"{n_vol:,}"
+            if n_oi >= 15000 or n_vol >= 5000:
+                lq_pill, lq_clr = "ALTA", "#2ecc71"
+                lq_sub = "Cadena líquida · Muros GEX/VEX muy confiables"
+            elif n_oi >= 2500 or n_vol >= 800:
+                lq_pill, lq_clr = "MEDIA", "#ffcc00"
+                lq_sub = "Liquidez moderada · Confirma muros con velas"
+            else:
+                lq_pill, lq_clr = "BAJA", "#ff4d4d"
+                lq_sub = "Pocas opciones abiertas · Muros débiles, opera con velas"
+            lq_val = f"{oi_str} OI · {vol_str} Vol"
+
+            # 6) Detector de Trampas / Absorción en Muro (Put Wall & Call Wall)
+            d_pwall = ((spot_now - p_wall) / spot_now * 100.0) if (spot_now > 0 and p_wall > 0) else 99.0
+            d_cwall = ((c_wall - spot_now) / spot_now * 100.0) if (spot_now > 0 and c_wall > 0) else 99.0
+            at_pwall = p_wall > 0 and (abs(d_pwall) <= 0.8 or spot_now <= p_wall * 1.005)
+            at_cwall = c_wall > 0 and (abs(d_cwall) <= 0.8 or spot_now >= c_wall * 0.995)
+            if at_pwall and iv_state == "down":
+                wt_pill, wt_clr = "ABSORCIÓN PUT", "#2ecc71"
+                wt_val = f"Toca Put Wall (${p_wall:g})"
+                wt_sub = "IV bajando en soporte → posible trampa short / rebote"
+            elif at_pwall and iv_state == "up":
+                wt_pill, wt_clr = "PRESIÓN PUT", "#ff4d4d"
+                wt_val = f"Presiona Put Wall (${p_wall:g})"
+                wt_sub = "IV subiendo en soporte → riesgo de ruptura bajista"
+            elif at_cwall and iv_state in ("down", "flat") and tot_gex_now >= 0:
+                wt_pill, wt_clr = "RECHAZO CALL", "#ffcc00"
+                wt_val = f"Toca Call Wall (${c_wall:g})"
+                wt_sub = "Techo en Gamma+ con IV plana/baja → posible trampa long"
+            elif at_cwall and iv_state == "up":
+                wt_pill, wt_clr = "PRESIÓN CALL", "#2ecc71"
+                wt_val = f"Presiona Call Wall (${c_wall:g})"
+                wt_sub = "IV subiendo en techo → posible ruptura / Call Squeeze"
+            elif at_pwall or at_cwall:
+                wt_pill, wt_clr = "EN MURO", "#ffcc00"
+                w_lbl = f"Put Wall ${p_wall:g}" if at_pwall else f"Call Wall ${c_wall:g}"
+                wt_val = f"Pegado a {w_lbl}"
+                wt_sub = "Refresca en vivo para confirmar si absorbe o rompe"
+            else:
+                wt_pill, wt_clr = "SIN TRAMPA", "#8b949e"
+                wt_val = f"Put ${p_wall:g} · Call ${c_wall:g}"
+                wt_sub = f"Put {-d_pwall:+.1f}% · Call {d_cwall:+.1f}% · Libre de muros"
+
+            def _inst_cell(icon_title, pill, clr, val_txt, sub_txt, border_right=True):
+                br = "border-right:1px solid #21262d;" if border_right else ""
+                val_c = "#e6edf3" if clr == "#8b949e" else clr
+                return (
+                    f'<div style="padding:8px 11px;{br}min-width:0;">'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;gap:4px;margin-bottom:2px;">'
+                    f'<span style="color:#8b949e;font-size:11px;font-weight:600;">{icon_title}</span>'
+                    f'<span style="background:rgba(255,255,255,0.06);border:1px solid {clr};color:{clr};font-size:10px;font-weight:700;padding:1px 6px;border-radius:4px;white-space:nowrap;">{pill}</span>'
+                    f'</div>'
+                    f'<div style="color:{val_c};font-size:13.5px;font-weight:800;line-height:1.25;">{val_txt}</div>'
+                    f'<div style="color:#9da7b3;font-size:11px;line-height:1.25;margin-top:2px;">{sub_txt}</div>'
+                    f'</div>'
+                )
+
+            inst_grid_html = (
+                '<div style="background:#0f141c;border:1.5px solid #348feb;border-radius:8px;overflow:hidden;margin-top:10px;margin-bottom:10px;">'
+                '<div style="background:rgba(52,143,235,0.14);border-bottom:1px solid #21262d;padding:5px 12px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">'
+                f'<span style="color:#58a6ff;font-size:11.5px;font-weight:800;letter-spacing:0.3px;">✨ CONTEXTO INSTITUCIONAL EN VIVO ({ticker})</span>'
+                '<span style="color:#8b949e;font-size:11px;">6 filtros en tiempo real · FlashAlpha</span>'
+                '</div>'
+                '<div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border-bottom:1px solid #21262d;">'
+                f'{_inst_cell("1. ⚖️ IV Skew (OTM)", sk_pill, sk_clr, sk_val, sk_sub, True)}'
+                f'{_inst_cell("2. 💰 IV vs HV 20d", ih_pill, ih_clr, ih_val, ih_sub, True)}'
+                f'{_inst_cell("3. 🎯 Gamma Flip", fl_pill, fl_clr, fl_val, fl_sub, False)}'
+                '</div>'
+                '<div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));">'
+                f'{_inst_cell("4. 🌅 Gap & Rango EM", em_pill, em_clr, em_val, em_sub, True)}'
+                f'{_inst_cell("5. 💧 Liquidez Opciones", lq_pill, lq_clr, lq_val, lq_sub, True)}'
+                f'{_inst_cell("6. 🛡️ Muros & Trampas", wt_pill, wt_clr, wt_val, wt_sub, False)}'
+                '</div></div>'
+            )
+            st.markdown(inst_grid_html, unsafe_allow_html=True)
 
             # Detector de Squeeze & Confluencias en Vivo (Las 4 Opciones Visibles al Mismo Tiempo + Hora Exacta HH:MM:SS + Silbato Festivo, Sirena y Voz)
             c_prem_sq = tac["total_call_prem_vol"]
