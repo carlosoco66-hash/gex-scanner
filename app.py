@@ -64,8 +64,17 @@ get_hv_and_gap_context = getattr(
     "get_hv_and_gap_context",
     lambda ticker: {"hv_20d": 0.0, "prev_close": 0.0, "today_open": 0.0},
 )
+get_macro_climate = getattr(
+    gex_engine,
+    "get_macro_climate",
+    lambda api_key: {"vix": 0.0, "vix_chg": 0.0, "vvix": 0.0, "vvix_chg": 0.0, "move": 0.0, "move_chg": 0.0, "indices_gex": {}},
+)
 
 # Funciones con caché para optimizar consultas de la API (60s para datos en vivo)
+@st.cache_data(ttl=300)
+def cached_macro_climate(api_key):
+    return get_macro_climate(api_key)
+
 @st.cache_data(ttl=1800)
 def cached_hv_and_gap_context(ticker):
     return get_hv_and_gap_context(ticker)
@@ -427,7 +436,58 @@ with st.sidebar.expander("🎨 Personalizar Colores", expanded=False):
     st.color_picker("Color de Spot", "#ffcc00")
 
 # --- UI PRINCIPAL ---
-st.markdown("<h1 style='font-size: 36px; margin-bottom: 20px;'>Gamma Scanner Options</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='font-size: 36px; margin-bottom: 10px;'>Gamma Scanner Options</h1>", unsafe_allow_html=True)
+
+# Cinta Macro del Mercado (VIX · VVIX · MOVE · Gamma SPY/QQQ/IWM — caché 5 min)
+macro_data = cached_macro_climate(api_key)
+m_vix = float(macro_data.get("vix", 0.0) or 0.0)
+m_vix_chg = float(macro_data.get("vix_chg", 0.0) or 0.0)
+m_vvix = float(macro_data.get("vvix", 0.0) or 0.0)
+m_move = float(macro_data.get("move", 0.0) or 0.0)
+m_move_chg = float(macro_data.get("move_chg", 0.0) or 0.0)
+m_idx = macro_data.get("indices_gex") or {}
+
+if m_vix > 0 or m_vvix > 0 or m_move > 0 or m_idx:
+    macro_parts = []
+    if m_vix > 0:
+        vc = "#ff4d4d" if m_vix >= 22 else ("#ffcc00" if m_vix >= 18 else "#2ecc71")
+        macro_parts.append(f'<span style="color:#c9d1d9;">VIX <b style="color:{vc};">{m_vix:.2f}</b> <span style="color:#8b949e;">({m_vix_chg:+.1f}%)</span></span>')
+    if m_vvix > 0:
+        vvc = "#ff4d4d" if m_vvix >= 110 else ("#ffcc00" if m_vvix >= 95 else "#c9d1d9")
+        macro_parts.append(f'<span style="color:#c9d1d9;">VVIX <b style="color:{vvc};">{m_vvix:.1f}</b></span>')
+    if m_move > 0:
+        mc = "#ff4d4d" if m_move >= 105 else ("#ffcc00" if m_move >= 95 else "#c9d1d9")
+        macro_parts.append(f'<span style="color:#c9d1d9;">MOVE <b style="color:{mc};">{m_move:.1f}</b> <span style="color:#8b949e;">({m_move_chg:+.1f}%)</span></span>')
+    if m_idx:
+        idx_txts = []
+        for sym_i in ("SPY", "QQQ", "IWM"):
+            if sym_i in m_idx:
+                sgn = "+" if m_idx[sym_i] >= 0 else "−"
+                iclr = "#2ecc71" if m_idx[sym_i] >= 0 else "#ff4d4d"
+                idx_txts.append(f'<b style="color:{iclr};">{sym_i} {sgn}</b>')
+        if idx_txts:
+            macro_parts.append(" · ".join(idx_txts))
+
+    neg_cnt = sum(1 for v in m_idx.values() if v < 0)
+    pos_cnt = sum(1 for v in m_idx.values() if v >= 0)
+    if m_vix >= 22 or (m_move >= 105 and neg_cnt >= 2) or (neg_cnt == 3 and m_vix >= 18):
+        m_clr, m_lbl = "#ff4d4d", "⛈️ CLIMA TENSO (RIESGO)"
+    elif m_vix >= 18 or m_vvix >= 100 or (neg_cnt > pos_cnt):
+        m_clr, m_lbl = "#ffcc00", "🌤️ CLIMA MIXTO"
+    else:
+        m_clr, m_lbl = "#2ecc71", "☀️ CLIMA ESTABLE"
+
+    macro_sep = '<span style="color:#30363d;margin:0 8px;">|</span>'
+    st.markdown(
+        f'<div style="background:#161b22;border:1px solid #30363d;border-left:4px solid {m_clr};border-radius:8px;padding:7px 14px;margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;font-size:12.5px;">'
+        f'<div style="display:flex;align-items:center;flex-wrap:wrap;gap:2px;">'
+        f'<span style="color:#ffffff;font-weight:800;margin-right:10px;">🌍 MACRO</span>'
+        f'{macro_sep.join(macro_parts)}'
+        f'</div>'
+        f'<span style="background:rgba(255,255,255,0.06);border:1px solid {m_clr};color:{m_clr};font-size:11px;font-weight:800;padding:2px 8px;border-radius:5px;white-space:nowrap;">{m_lbl}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
 # Inicializar estados
 if 'expirations' not in st.session_state:
@@ -950,11 +1010,13 @@ if st.session_state.expirations:
                     unsafe_allow_html=True,
                 )
             with t_col3:
+                mp_val = float(tac.get("max_pain", 0.0) or 0.0)
+                mp_txt = f" | MP: <b>${mp_val:g}</b>" if mp_val > 0 else ""
                 st.markdown(
                     f'<div style="background:#161b22;border:1px solid #30363d;border-left:4px solid {pin_color};border-radius:8px;padding:12px 16px;">'
                     f'<p style="color:#8b949e;margin:0;font-size:12px;">Flow Levels & Pin Risk</p>'
                     f'<p style="color:#ffffff;margin:4px 0 2px 0;font-size:22px;font-weight:800;">Pin ${pin_st:g} <span style="font-size:13px;color:{pin_color};">({pin_sc:.0f}/100 {pin_lbl})</span></p>'
-                    f'<p style="color:#c9d1d9;margin:0;font-size:11px;">Piso (Put): <b>${p_wall:g}</b> | Techo (Call): <b>${c_wall:g}</b></p>'
+                    f'<p style="color:#c9d1d9;margin:0;font-size:11px;">Piso (Put): <b>${p_wall:g}</b> | Techo (Call): <b>${c_wall:g}</b>{mp_txt}</p>'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
@@ -994,10 +1056,14 @@ if st.session_state.expirations:
                 sk_val = f"Dif. {skew_diff:+.1f}% (OTM)"
                 sk_sub = f"Call {c_otm_iv:.1f}% vs Put {p_otm_iv:.1f}% · Sin sesgo extremo"
 
-            # 2) IV vs HV 20d
+            # 2) IV vs HV 20d (+ VRP en puntos y riesgo vol-of-vol)
             if hv_20d > 1.0:
                 iv_hv_ratio = atm_iv_pct / hv_20d
-                if iv_hv_ratio >= 1.15:
+                vrp_pts = atm_iv_pct - hv_20d
+                if vrp_pts <= -10.0:
+                    ih_pill, ih_clr = "VRP RIESGO", "#ff8c00"
+                    ih_sub = f"Ratio {iv_hv_ratio:.2f}x · IV muy barata vs volatilidad real (riesgo vol-of-vol)"
+                elif iv_hv_ratio >= 1.15:
                     ih_pill, ih_clr = "CARAS", "#ff4d4d"
                     ih_sub = f"Ratio {iv_hv_ratio:.2f}x · Cuidado con IV crush al comprar"
                 elif iv_hv_ratio <= 0.90:
@@ -1006,7 +1072,7 @@ if st.session_state.expirations:
                 else:
                     ih_pill, ih_clr = "JUSTAS", "#ffcc00"
                     ih_sub = f"Ratio {iv_hv_ratio:.2f}x · Prima en valor justo"
-                ih_val = f"IV {atm_iv_pct:.1f}% vs HV {hv_20d:.1f}%"
+                ih_val = f"IV {atm_iv_pct:.1f}% vs HV {hv_20d:.1f}% ({vrp_pts:+.1f} pts)"
             else:
                 ih_pill, ih_clr = "N/D", "#8b949e"
                 ih_val = f"IV {atm_iv_pct:.1f}% (sin HV)"
@@ -1121,11 +1187,34 @@ if st.session_state.expirations:
                     f'</div>'
                 )
 
+            # Curva IV (Term Structure: Contango vs Backwardation) en el encabezado azul
+            ts_near = float(tac.get("ts_near_iv", 0.0) or 0.0)
+            ts_far = float(tac.get("ts_far_iv", 0.0) or 0.0)
+            ts_nd = int(tac.get("ts_near_dte", 0) or 0)
+            ts_fd = int(tac.get("ts_far_dte", 0) or 0)
+            if ts_near > 1.0 and ts_far > 1.0:
+                ts_diff = ts_far - ts_near
+                if ts_diff <= -2.0:
+                    ts_lbl, ts_pill, ts_clr = f"BACKWARDATION ({ts_diff:+.1f}%)", "RISK", "#ff4d4d"
+                elif ts_diff >= 2.0:
+                    ts_lbl, ts_pill, ts_clr = f"CONTANGO ({ts_diff:+.1f}%)", "NORMAL", "#2ecc71"
+                else:
+                    ts_lbl, ts_pill, ts_clr = f"PLANA ({ts_diff:+.1f}%)", "NEUTRO", "#ffcc00"
+                ts_header_html = (
+                    f'<span style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:11px;">'
+                    f'<span style="color:#8b949e;">Curva IV ({ts_nd}d: {ts_near:.0f}% vs {ts_fd}d: {ts_far:.0f}%):</span>'
+                    f'<b style="color:{ts_clr};">{ts_lbl}</b>'
+                    f'<span style="background:rgba(255,255,255,0.06);border:1px solid {ts_clr};color:{ts_clr};font-size:10px;font-weight:700;padding:1px 6px;border-radius:4px;">{ts_pill}</span>'
+                    f'</span>'
+                )
+            else:
+                ts_header_html = '<span style="color:#8b949e;font-size:11px;">6 filtros en tiempo real · FlashAlpha</span>'
+
             inst_grid_html = (
                 '<div style="background:#0f141c;border:1.5px solid #348feb;border-radius:8px;overflow:hidden;margin-top:10px;margin-bottom:10px;">'
                 '<div style="background:rgba(52,143,235,0.14);border-bottom:1px solid #21262d;padding:5px 12px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">'
                 f'<span style="color:#58a6ff;font-size:11.5px;font-weight:800;letter-spacing:0.3px;">✨ CONTEXTO INSTITUCIONAL EN VIVO ({ticker})</span>'
-                '<span style="color:#8b949e;font-size:11px;">6 filtros en tiempo real · FlashAlpha</span>'
+                f'{ts_header_html}'
                 '</div>'
                 '<div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border-bottom:1px solid #21262d;">'
                 f'{_inst_cell("1. ⚖️ IV Skew (OTM)", sk_pill, sk_clr, sk_val, sk_sub, True)}'

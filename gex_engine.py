@@ -126,6 +126,142 @@ def get_hv_and_gap_context(ticker):
     return out
 
 
+def get_macro_climate(api_key):
+    """Obtiene clima macro (VIX, VVIX, MOVE vía yfinance + signo GEX en vivo de SPY/QQQ/IWM vía FlashAlpha)."""
+    macro = {
+        "vix": 0.0, "vix_chg": 0.0,
+        "vvix": 0.0, "vvix_chg": 0.0,
+        "move": 0.0, "move_chg": 0.0,
+        "indices_gex": {},
+    }
+    for key, sym in (("vix", "^VIX"), ("vvix", "^VVIX"), ("move", "^MOVE")):
+        try:
+            t = yf.Ticker(sym)
+            hist = t.history(period="5d", interval="1d")
+            if hist is not None and not hist.empty and "Close" in hist.columns:
+                closes = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+                if len(closes) >= 1:
+                    last_v = float(closes.iloc[-1])
+                    prev_v = float(closes.iloc[-2]) if len(closes) >= 2 else last_v
+                    try:
+                        fi_last = t.fast_info.get("lastPrice")
+                        fi_prev = t.fast_info.get("previousClose") or t.fast_info.get("regularMarketPreviousClose")
+                        if fi_last and float(fi_last) > 0:
+                            last_v = float(fi_last)
+                        if fi_prev and float(fi_prev) > 0:
+                            prev_v = float(fi_prev)
+                    except Exception:
+                        pass
+                    macro[key] = last_v
+                    macro[f"{key}_chg"] = ((last_v - prev_v) / prev_v * 100.0) if prev_v > 0 else 0.0
+        except Exception:
+            pass
+
+    if api_key:
+        for idx_sym in ("SPY", "QQQ", "IWM"):
+            try:
+                resp = _flashalpha_get(f"/v1/gex/live-flow/{idx_sym}", api_key, timeout=6)
+                if isinstance(resp, dict):
+                    gex_blk = resp.get("gex") or {}
+                    sum_blk = resp.get("summary") or {}
+                    val = gex_blk.get("live_net_gex")
+                    if val is None:
+                        val = sum_blk.get("live_gex")
+                    if val is not None:
+                        macro["indices_gex"][idx_sym] = 1 if float(val) >= 0 else -1
+            except Exception:
+                pass
+    return macro
+
+
+def _compute_term_structure(df_all, spot):
+    """Calcula Curva IV (Term Structure: Contango vs Backwardation) sin llamadas extra usando toda la cadena."""
+    res = {"ts_near_iv": 0.0, "ts_far_iv": 0.0, "ts_near_dte": 0, "ts_far_dte": 0}
+    if df_all is None or df_all.empty or spot <= 0 or "expiry" not in df_all.columns:
+        return res
+    try:
+        today = datetime.date.today()
+        exps_dte = []
+        for exp in df_all["expiry"].dropna().unique():
+            try:
+                d = (datetime.datetime.strptime(str(exp), "%Y-%m-%d").date() - today).days
+                if d >= 0:
+                    exps_dte.append((d, str(exp)))
+            except Exception:
+                pass
+        if len(exps_dte) < 2:
+            return res
+        exps_dte.sort(key=lambda x: x[0])
+
+        # Vencimiento cercano (preferir >=1 DTE para evitar distorsión de último minuto en 0 DTE; si no, el menor)
+        near_cands = [x for x in exps_dte if x[0] >= 1]
+        near_dte, near_exp = near_cands[0] if near_cands else exps_dte[0]
+
+        # Vencimiento lejano (más cercano a 30 DTE entre >= 14 DTE, o el más lejano disponible > near_dte)
+        far_cands = [x for x in exps_dte if x[0] >= max(near_dte + 7, 14)]
+        if far_cands:
+            far_dte, far_exp = min(far_cands, key=lambda x: abs(x[0] - 30))
+        else:
+            longer = [x for x in exps_dte if x[0] > near_dte]
+            if not longer:
+                return res
+            far_dte, far_exp = longer[-1]
+
+        def _exp_atm_iv_pct(exp_str, dte_val):
+            sub = df_all[df_all["expiry"] == exp_str].copy()
+            if sub.empty:
+                return 0.0
+            sub["strike_n"] = pd.to_numeric(sub["strike"], errors="coerce")
+            sub = sub.dropna(subset=["strike_n"])
+            sub["dist_s"] = (sub["strike_n"] - spot).abs()
+            sub = sub.nsmallest(8, "dist_s")
+
+            # 1) IV directa si viene en FlashAlpha
+            for iv_k in ("iv", "implied_volatility", "impliedVolatility", "mid_iv", "mark_iv", "volatility"):
+                if iv_k in sub.columns:
+                    vals = pd.to_numeric(sub[iv_k], errors="coerce").dropna()
+                    vals = vals.apply(lambda v: v / 100.0 if v > 3.0 else v)
+                    vals = vals[(vals > 0.02) & (vals < 3.5)]
+                    if not vals.empty:
+                        return float(vals.median() * 100.0)
+
+            # 2) Resolver IV por Black-Scholes desde precio o gamma/delta
+            T_iv = max(float(dte_val), 0.25) / 365.0
+            ivs = []
+            for _, r in sub.iterrows():
+                k_v = float(r["strike_n"])
+                opt_t = r.get("type", "C")
+                p_v = 0.0
+                for pk in ("mid", "mark", "last", "price"):
+                    if pk in r and pd.notna(r[pk]) and float(r[pk] or 0) > 0:
+                        p_v = float(r[pk])
+                        break
+                if p_v <= 0 and "bid" in r and "ask" in r:
+                    bv = float(pd.to_numeric(r.get("bid"), errors="coerce") or 0.0)
+                    av = float(pd.to_numeric(r.get("ask"), errors="coerce") or 0.0)
+                    if bv > 0 and av > 0:
+                        p_v = 0.5 * (bv + av)
+                iv_c = _solve_iv_from_price(p_v, spot, k_v, T_iv, opt_t) if p_v > 0 else 0.0
+                if iv_c <= 0:
+                    g_v = float(pd.to_numeric(r.get("gamma"), errors="coerce") or 0.0)
+                    d_v = float(pd.to_numeric(r.get("delta"), errors="coerce") or 0.0)
+                    iv_c = _solve_iv_from_greeks(g_v, d_v, spot, T_iv, opt_t)
+                if 0.02 < iv_c < 3.5:
+                    ivs.append(iv_c * 100.0)
+            return float(np.median(ivs)) if ivs else 0.0
+
+        near_iv = _exp_atm_iv_pct(near_exp, near_dte)
+        far_iv = _exp_atm_iv_pct(far_exp, far_dte)
+        if near_iv > 1.0 and far_iv > 1.0:
+            res["ts_near_iv"] = round(near_iv, 2)
+            res["ts_far_iv"] = round(far_iv, 2)
+            res["ts_near_dte"] = int(near_dte)
+            res["ts_far_dte"] = int(far_dte)
+    except Exception as e:
+        print(f"Error computing term structure: {e}")
+    return res
+
+
 def get_options_expirations(ticker, api_key):
     """Obtiene la lista de fechas de expiración disponibles usando FlashAlpha."""
     try:
@@ -167,10 +303,12 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
         
     # 2. Descargar cadena cruda con fa.option_quote
     df_raw = pd.DataFrame()
+    term_struct_info = {"ts_near_iv": 0.0, "ts_far_iv": 0.0, "ts_near_dte": 0, "ts_far_dte": 0}
     try:
         data_quote = fa.option_quote(ticker)
         df_raw = pd.DataFrame(data_quote)
         if not df_raw.empty:
+            term_struct_info = _compute_term_structure(df_raw, spot)
             if selected_expirations:
                 df_raw = df_raw[df_raw['expiry'].isin(selected_expirations)].copy()
             # Calcular dte manualmente
@@ -493,6 +631,12 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
     df_raw['call_chex'] = call_chex_list
     df_raw['put_chex'] = put_chex_list
     df_raw['net_chex'] = df_raw['call_chex'] + df_raw['put_chex']
+
+    # Adjuntar metadatos de Term Structure al DataFrame crudo para el Panel Táctico
+    df_raw['ts_near_iv'] = term_struct_info["ts_near_iv"]
+    df_raw['ts_far_iv'] = term_struct_info["ts_far_iv"]
+    df_raw['ts_near_dte'] = term_struct_info["ts_near_dte"]
+    df_raw['ts_far_dte'] = term_struct_info["ts_far_dte"]
     
     # Agrupar por strike
     df_gex = df_raw.groupby('strike').agg({
@@ -810,6 +954,11 @@ def calculate_tactical_metrics(df_gex, df_raw, spot, live_flow=None):
     tactical["iv_skew_pct"] = call_otm_iv_pct - put_otm_iv_pct
     tactical["near_oi_10"] = near_oi_10
     tactical["near_vol_10"] = near_vol_10
+    tactical["max_pain"] = float(calc_max_pain(df_gex))
+    tactical["ts_near_iv"] = float(df_raw["ts_near_iv"].iloc[0]) if (not df_raw.empty and "ts_near_iv" in df_raw.columns) else 0.0
+    tactical["ts_far_iv"] = float(df_raw["ts_far_iv"].iloc[0]) if (not df_raw.empty and "ts_far_iv" in df_raw.columns) else 0.0
+    tactical["ts_near_dte"] = int(df_raw["ts_near_dte"].iloc[0]) if (not df_raw.empty and "ts_near_dte" in df_raw.columns) else 0
+    tactical["ts_far_dte"] = int(df_raw["ts_far_dte"].iloc[0]) if (not df_raw.empty and "ts_far_dte" in df_raw.columns) else 0
 
     # 3. Call Wall, Put Wall y Pin Risk Score (0-100) por Strike
     df_near = df_gex[(df_gex["strike"] >= spot * 0.75) & (df_gex["strike"] <= spot * 1.25)].copy()
