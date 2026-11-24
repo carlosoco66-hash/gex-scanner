@@ -810,13 +810,151 @@ if st.session_state.expirations:
                     ].copy()
 
                     if not lf_sub.empty:
-                        st.markdown("<h4 style='margin-top:16px;'>Top Strikes Activos (Live Flow GEX & Volumen)</h4>", unsafe_allow_html=True)
+                        st.markdown("<h4 style='margin-top:16px;margin-bottom:8px;'>Top Strikes Activos (Live Flow GEX & Volumen)</h4>", unsafe_allow_html=True)
                         top_flow_df = lf_sub.sort_values(["total_volume", "call_oi", "put_oi"], ascending=False).head(10)[
                             ["strike", "call_volume", "put_volume", "call_oi", "put_oi", "call_gex", "put_gex", "net_gex"]
-                        ].copy()
+                        ].copy().reset_index(drop=True)
                         for int_c in ["call_volume", "put_volume", "call_oi", "put_oi"]:
                             top_flow_df[int_c] = top_flow_df[int_c].astype(int)
-                        st.dataframe(top_flow_df, use_container_width=True, hide_index=True)
+
+                        def _top3_rank_map(df_src, col_name):
+                            pos = df_src[df_src[col_name] > 0].sort_values(col_name, ascending=False).head(3)
+                            return {idx: rank for rank, idx in enumerate(pos.index.tolist(), start=1)}, pos
+
+                        cvol_ranks, cvol_top = _top3_rank_map(top_flow_df, "call_volume")
+                        pvol_ranks, pvol_top = _top3_rank_map(top_flow_df, "put_volume")
+                        coi_ranks, coi_top = _top3_rank_map(top_flow_df, "call_oi")
+                        poi_ranks, poi_top = _top3_rank_map(top_flow_df, "put_oi")
+
+                        def _fmt_k(v):
+                            v = int(v)
+                            if v >= 1_000_000:
+                                return f"{v/1_000_000:.1f}M"
+                            if v >= 1_000:
+                                return f"{v/1_000:.1f}K"
+                            return f"{v:,}"
+
+                        def _vol_cell(val, rank, is_call):
+                            txt = f"{int(val):,}"
+                            if is_call:
+                                if rank == 1:
+                                    return f'<span style="display:inline-block;padding:2px 7px;border-radius:4px;font-weight:800;background:rgba(0,230,118,0.36);border:1.5px solid #00e676;color:#ffffff;">{txt}</span>'
+                                if rank == 2:
+                                    return f'<span style="display:inline-block;padding:2px 7px;border-radius:4px;font-weight:700;background:rgba(46,204,113,0.18);border:1px solid rgba(46,204,113,0.68);color:#e6edf3;">{txt}</span>'
+                                if rank == 3:
+                                    return f'<span style="display:inline-block;padding:2px 7px;border-radius:4px;font-weight:600;background:rgba(46,204,113,0.08);border:1px solid rgba(46,204,113,0.34);color:#b0bac5;">{txt}</span>'
+                            else:
+                                if rank == 1:
+                                    return f'<span style="display:inline-block;padding:2px 7px;border-radius:4px;font-weight:800;background:rgba(255,59,48,0.38);border:1.5px solid #ff3b30;color:#ffffff;">{txt}</span>'
+                                if rank == 2:
+                                    return f'<span style="display:inline-block;padding:2px 7px;border-radius:4px;font-weight:700;background:rgba(255,77,77,0.18);border:1px solid rgba(255,77,77,0.68);color:#e6edf3;">{txt}</span>'
+                                if rank == 3:
+                                    return f'<span style="display:inline-block;padding:2px 7px;border-radius:4px;font-weight:600;background:rgba(255,77,77,0.08);border:1px solid rgba(255,77,77,0.34);color:#b0bac5;">{txt}</span>'
+                            return f'<span style="color:#8b949e;">{txt}</span>'
+
+                        def _oi_cell(val, rank, is_call):
+                            txt = f"{int(val):,}"
+                            if is_call:
+                                if rank == 1:
+                                    return f'<span style="display:inline-block;padding:2px 7px;border-radius:4px;font-weight:700;background:rgba(56,189,248,0.16);border:1.5px solid #38bdf8;color:#e0f2fe;">{txt}</span>'
+                                if rank == 2:
+                                    return f'<span style="display:inline-block;padding:2px 7px;border-radius:4px;font-weight:600;border:1px solid rgba(56,189,248,0.55);color:#bae6fd;">{txt}</span>'
+                                if rank == 3:
+                                    return f'<span style="display:inline-block;padding:2px 7px;border-radius:4px;border:1px solid rgba(56,189,248,0.28);color:#94a3b8;">{txt}</span>'
+                            else:
+                                if rank == 1:
+                                    return f'<span style="display:inline-block;padding:2px 7px;border-radius:4px;font-weight:700;background:rgba(251,191,36,0.16);border:1.5px solid #fbbf24;color:#fef3c7;">{txt}</span>'
+                                if rank == 2:
+                                    return f'<span style="display:inline-block;padding:2px 7px;border-radius:4px;font-weight:600;border:1px solid rgba(251,191,36,0.55);color:#fde68a;">{txt}</span>'
+                                if rank == 3:
+                                    return f'<span style="display:inline-block;padding:2px 7px;border-radius:4px;border:1px solid rgba(251,191,36,0.28);color:#94a3b8;">{txt}</span>'
+                            return f'<span style="color:#8b949e;">{txt}</span>'
+
+                        def _chips_row(df_top, col_name, styles):
+                            chips = []
+                            for r_i, (_, row_t) in enumerate(df_top.iterrows()):
+                                st_css = styles[min(r_i, len(styles) - 1)]
+                                chips.append(f'<span style="padding:2px 7px;border-radius:4px;font-size:11.5px;{st_css}">${float(row_t["strike"]):g} ({_fmt_k(row_t[col_name])})</span>')
+                            return " ".join(chips) if chips else '<span style="color:#8b949e;">N/D</span>'
+
+                        call_vol_chips = _chips_row(cvol_top, "call_volume", [
+                            "font-weight:800;background:rgba(0,230,118,0.36);border:1.5px solid #00e676;color:#ffffff;",
+                            "font-weight:700;background:rgba(46,204,113,0.18);border:1px solid rgba(46,204,113,0.65);color:#e6edf3;",
+                            "font-weight:600;background:rgba(46,204,113,0.08);border:1px solid rgba(46,204,113,0.32);color:#9da7b3;",
+                        ])
+                        put_vol_chips = _chips_row(pvol_top, "put_volume", [
+                            "font-weight:800;background:rgba(255,59,48,0.38);border:1.5px solid #ff3b30;color:#ffffff;",
+                            "font-weight:700;background:rgba(255,77,77,0.18);border:1px solid rgba(255,77,77,0.65);color:#e6edf3;",
+                            "font-weight:600;background:rgba(255,77,77,0.08);border:1px solid rgba(255,77,77,0.32);color:#9da7b3;",
+                        ])
+                        call_oi_chips = _chips_row(coi_top, "call_oi", [
+                            "font-weight:700;background:rgba(56,189,248,0.16);border:1.5px solid #38bdf8;color:#e0f2fe;",
+                            "font-weight:600;border:1px solid rgba(56,189,248,0.55);color:#bae6fd;",
+                            "border:1px solid rgba(56,189,248,0.28);color:#94a3b8;",
+                        ])
+                        put_oi_chips = _chips_row(poi_top, "put_oi", [
+                            "font-weight:700;background:rgba(251,191,36,0.16);border:1.5px solid #fbbf24;color:#fef3c7;",
+                            "font-weight:600;border:1px solid rgba(251,191,36,0.55);color:#fde68a;",
+                            "border:1px solid rgba(251,191,36,0.28);color:#94a3b8;",
+                        ])
+
+                        summary_strip_html = (
+                            '<div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:8px;">'
+                            '<div style="background:#161b22;border:1px solid #30363d;border-left:4px solid #00e676;border-radius:8px;padding:7px 10px;display:flex;flex-direction:column;gap:5px;">'
+                            f'<div style="display:flex;align-items:center;flex-wrap:wrap;gap:5px;"><span style="color:#00e676;font-size:11.5px;font-weight:800;">🟢 CALL VOL:</span>{call_vol_chips}</div>'
+                            f'<div style="display:flex;align-items:center;flex-wrap:wrap;gap:5px;"><span style="color:#38bdf8;font-size:11.5px;font-weight:700;">🏛️ CALL OI:</span>{call_oi_chips}</div>'
+                            '</div>'
+                            '<div style="background:#161b22;border:1px solid #30363d;border-left:4px solid #ff3b30;border-radius:8px;padding:7px 10px;display:flex;flex-direction:column;gap:5px;">'
+                            f'<div style="display:flex;align-items:center;flex-wrap:wrap;gap:5px;"><span style="color:#ff4d4d;font-size:11.5px;font-weight:800;">🔴 PUT VOL:</span>{put_vol_chips}</div>'
+                            f'<div style="display:flex;align-items:center;flex-wrap:wrap;gap:5px;"><span style="color:#fbbf24;font-size:11.5px;font-weight:700;">🏛️ PUT OI:</span>{put_oi_chips}</div>'
+                            '</div></div>'
+                        )
+                        st.markdown(summary_strip_html, unsafe_allow_html=True)
+
+                        lf_rows_html = ""
+                        for idx_f, rf in top_flow_df.iterrows():
+                            cr = cvol_ranks.get(idx_f, 0)
+                            pr = pvol_ranks.get(idx_f, 0)
+                            coir = coi_ranks.get(idx_f, 0)
+                            poir = poi_ranks.get(idx_f, 0)
+                            battle_ic = ' <span title="Zona de batalla: Top 3 en Call Vol y Put Vol">⚔️</span>' if (cr > 0 and pr > 0) else ""
+                            cg_v = float(rf["call_gex"])
+                            pg_v = float(rf["put_gex"])
+                            ng_v = float(rf["net_gex"])
+                            ng_clr = "#2ecc71" if ng_v > 0 else ("#ff4d4d" if ng_v < 0 else "#8b949e")
+                            cg_txt = f"+{format_millions(cg_v, 'USD')}" if cg_v > 0 else format_millions(cg_v, "USD")
+                            ng_txt = f"+{format_millions(ng_v, 'USD')}" if ng_v > 0 else format_millions(ng_v, "USD")
+                            lf_rows_html += (
+                                f'<tr style="border-bottom:1px solid #21262d;">'
+                                f'<td style="padding:6px 8px;text-align:left;font-weight:800;color:#ffffff;white-space:nowrap;">${float(rf["strike"]):g}{battle_ic}</td>'
+                                f'<td style="padding:6px 8px;text-align:right;white-space:nowrap;">{_vol_cell(rf["call_volume"], cr, True)}</td>'
+                                f'<td style="padding:6px 8px;text-align:right;white-space:nowrap;">{_vol_cell(rf["put_volume"], pr, False)}</td>'
+                                f'<td style="padding:6px 8px;text-align:right;white-space:nowrap;">{_oi_cell(rf["call_oi"], coir, True)}</td>'
+                                f'<td style="padding:6px 8px;text-align:right;white-space:nowrap;">{_oi_cell(rf["put_oi"], poir, False)}</td>'
+                                f'<td style="padding:6px 8px;text-align:right;color:#2ecc71;white-space:nowrap;">{cg_txt}</td>'
+                                f'<td style="padding:6px 8px;text-align:right;color:#ff4d4d;white-space:nowrap;">{format_millions(pg_v, "USD")}</td>'
+                                f'<td style="padding:6px 8px;text-align:right;font-weight:700;color:{ng_clr};white-space:nowrap;">{ng_txt}</td>'
+                                f'</tr>'
+                            )
+
+                        lf_tbl_html = (
+                            '<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;overflow:hidden;margin-bottom:6px;">'
+                            '<table style="width:100%;border-collapse:collapse;font-size:12.5px;font-family:\'Inter\',sans-serif;">'
+                            '<thead><tr style="background:#161b22;border-bottom:1px solid #30363d;color:#8b949e;">'
+                            '<th style="padding:7px 8px;text-align:left;">Strike</th>'
+                            '<th style="padding:7px 8px;text-align:right;">Call Vol</th>'
+                            '<th style="padding:7px 8px;text-align:right;">Put Vol</th>'
+                            '<th style="padding:7px 8px;text-align:right;">Call OI</th>'
+                            '<th style="padding:7px 8px;text-align:right;">Put OI</th>'
+                            '<th style="padding:7px 8px;text-align:right;">Call GEX</th>'
+                            '<th style="padding:7px 8px;text-align:right;">Put GEX</th>'
+                            '<th style="padding:7px 8px;text-align:right;">Net GEX</th>'
+                            '</tr></thead>'
+                            f'<tbody>{lf_rows_html}</tbody>'
+                            '</table></div>'
+                        )
+                        st.markdown(lf_tbl_html, unsafe_allow_html=True)
+                        st.caption("💡 **Mapa de intensidad (fuerte → medio → suave):** 🟢 Verde = Top 3 Call Vol hoy · 🔴 Rojo = Top 3 Put Vol hoy · 🔵 Cian = Top 3 Call OI · 🟡 Ámbar = Top 3 Put OI · **⚔️ = Zona de batalla** (strike en Top 3 de Calls y Puts a la vez).")
 
             # Fila 4.85: Panel 3 · PANEL TÁCTICO INTRADÍA (VEX, CHEX, Pin Risk & Expected Move)
             st.markdown("<h2 class='custom-header'>3 · PANEL TÁCTICO INTRADÍA (VEX, CHEX, Pin Risk & Expected Move)</h2>", unsafe_allow_html=True)
