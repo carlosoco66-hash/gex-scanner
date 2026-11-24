@@ -262,6 +262,82 @@ def _compute_term_structure(df_all, spot):
     return res
 
 
+def _build_full_chain_scanner_records(df_full, spot, mode="USD"):
+    """
+    Prepara un resumen liviano de contratos de TODA la cadena (Intradía 0–7d, Swing 8–60d,
+    Largo Plazo >60d y Vista Completa) sin llamadas extra a la API.
+    """
+    if df_full is None or df_full.empty or spot <= 0:
+        return []
+    try:
+        df = df_full.copy()
+        if 'expiry' not in df.columns or 'strike' not in df.columns or 'type' not in df.columns:
+            return []
+
+        today = datetime.date.today()
+
+        def _parse_dte(e):
+            try:
+                return (datetime.datetime.strptime(str(e)[:10], "%Y-%m-%d").date() - today).days
+            except Exception:
+                return -1
+
+        df['dte'] = df['expiry'].apply(_parse_dte)
+        df = df[df['dte'] >= 0].copy()
+        if df.empty:
+            return []
+
+        df['strike'] = pd.to_numeric(df['strike'], errors='coerce')
+        df['gamma'] = pd.to_numeric(df['gamma'], errors='coerce') if 'gamma' in df.columns else pd.Series(np.nan, index=df.index)
+        df['delta'] = pd.to_numeric(df['delta'], errors='coerce') if 'delta' in df.columns else pd.Series(np.nan, index=df.index)
+        df['open_interest'] = (
+            pd.to_numeric(df['open_interest'], errors='coerce').fillna(0.0)
+            if 'open_interest' in df.columns else 0.0
+        )
+        df['volume'] = (
+            pd.to_numeric(df['volume'], errors='coerce').fillna(0.0)
+            if 'volume' in df.columns else 0.0
+        )
+        df = df.dropna(subset=['strike'])
+        if df.empty:
+            return []
+
+        # Completar Gamma y Delta de Puts con paridad Call-Put
+        df_c = df[df['type'] == 'C'][['strike', 'expiry', 'gamma', 'delta']].drop_duplicates(
+            subset=['strike', 'expiry']
+        ).rename(columns={'gamma': 'call_gamma', 'delta': 'call_delta'})
+        df = df.merge(df_c, on=['strike', 'expiry'], how='left')
+        df['gamma'] = df['call_gamma'].where(df['call_gamma'].notna(), df['gamma']).fillna(0.0).astype(float)
+        is_put = df['type'] == 'P'
+        df['delta'] = np.where(is_put & df['call_delta'].notna(), df['call_delta'] - 1.0, df['delta'])
+        df['delta'] = pd.to_numeric(df['delta'], errors='coerce').fillna(0.0).astype(float)
+
+        gex_mult = spot if mode == "Acciones" else (spot * spot)
+        sign = np.where(df['type'] == 'C', 1.0, -1.0)
+        df['net_gex'] = sign * df['open_interest'] * df['gamma'] * gex_mult
+        df['vol_gex'] = sign * df['volume'] * df['gamma'] * gex_mult
+
+        df['_score_all'] = df['open_interest'] + df['volume']
+        df['_score_intra'] = df['volume'] * 2.0 + df['open_interest']
+
+        buckets = [
+            df.nlargest(25, '_score_all'),
+            df[df['dte'] <= 7].nlargest(25, '_score_intra'),
+            df[(df['dte'] >= 8) & (df['dte'] <= 60)].nlargest(25, '_score_all'),
+            df[df['dte'] > 60].nlargest(25, '_score_all'),
+        ]
+        non_empty = [b for b in buckets if not b.empty]
+        if not non_empty:
+            return []
+        combined = pd.concat(non_empty, ignore_index=True)
+        combined = combined.drop_duplicates(subset=['type', 'strike', 'expiry'], keep='first')
+        cols = ['type', 'strike', 'expiry', 'dte', 'open_interest', 'volume', 'delta', 'net_gex', 'vol_gex']
+        return combined[cols].to_dict('records')
+    except Exception as e:
+        print(f"Error building full chain scanner records: {e}")
+        return []
+
+
 def get_options_expirations(ticker, api_key):
     """Obtiene la lista de fechas de expiración disponibles usando FlashAlpha."""
     try:
@@ -304,11 +380,13 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
     # 2. Descargar cadena cruda con fa.option_quote
     df_raw = pd.DataFrame()
     term_struct_info = {"ts_near_iv": 0.0, "ts_far_iv": 0.0, "ts_near_dte": 0, "ts_far_dte": 0}
+    full_chain_scanner_records = []
     try:
         data_quote = fa.option_quote(ticker)
         df_raw = pd.DataFrame(data_quote)
         if not df_raw.empty:
             term_struct_info = _compute_term_structure(df_raw, spot)
+            full_chain_scanner_records = _build_full_chain_scanner_records(df_raw, spot, mode=mode)
             if selected_expirations:
                 df_raw = df_raw[df_raw['expiry'].isin(selected_expirations)].copy()
             # Calcular dte manualmente
@@ -508,6 +586,7 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
         df_raw['call_gex'] = df_raw.apply(lambda r: r['open_interest'] * r['gamma'] * spot if r['type'] == 'C' else 0.0, axis=1)
         df_raw['put_gex'] = df_raw.apply(lambda r: -r['open_interest'] * r['gamma'] * spot if r['type'] == 'P' else 0.0, axis=1)
         df_raw['net_gex'] = df_raw['call_gex'] + df_raw['put_gex']
+        df_raw['vol_gex'] = df_raw.apply(lambda r: (r['volume'] * r['gamma'] * spot) if r['type'] == 'C' else (-r['volume'] * r['gamma'] * spot), axis=1)
         
         df_raw['call_dex'] = df_raw.apply(lambda r: r['open_interest'] * r['delta'] * spot if r['type'] == 'C' else 0.0, axis=1)
         df_raw['put_dex'] = df_raw.apply(lambda r: r['open_interest'] * r['delta'] * spot if r['type'] == 'P' else 0.0, axis=1)
@@ -517,6 +596,7 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
         df_raw['call_gex'] = df_raw.apply(lambda r: r['open_interest'] * r['gamma'] * spot * spot if r['type'] == 'C' else 0.0, axis=1)
         df_raw['put_gex'] = df_raw.apply(lambda r: -r['open_interest'] * r['gamma'] * spot * spot if r['type'] == 'P' else 0.0, axis=1)
         df_raw['net_gex'] = df_raw['call_gex'] + df_raw['put_gex']
+        df_raw['vol_gex'] = df_raw.apply(lambda r: (r['volume'] * r['gamma'] * spot * spot) if r['type'] == 'C' else (-r['volume'] * r['gamma'] * spot * spot), axis=1)
         
         df_raw['call_dex'] = df_raw.apply(lambda r: r['open_interest'] * r['delta'] * spot * 100.0 if r['type'] == 'C' else 0.0, axis=1)
         df_raw['put_dex'] = df_raw.apply(lambda r: r['open_interest'] * r['delta'] * spot * 100.0 if r['type'] == 'P' else 0.0, axis=1)
@@ -666,6 +746,9 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
         'put_dex': 'sum',
         'net_dex': 'sum'
     }).reset_index()
+
+    # Adjuntar resumen liviano de toda la cadena para el Scanner de 4 horizontes
+    df_raw.attrs['full_chain_scanner'] = full_chain_scanner_records
 
     return df_gex, df_dex, df_raw, spot
 

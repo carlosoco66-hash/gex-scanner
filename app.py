@@ -2180,41 +2180,273 @@ if st.session_state.expirations:
             fig_oi = plot_oi_gex_plotly(df_gex, res['Spot Price'], pct=rango_pct)
             st.plotly_chart(fig_oi, use_container_width=True)
 
-            # Fila 6: Tabla del Scanner de Contratos Frontales
+            # Fila 6: Scanner de Contratos por Horizonte (4 vistas: Completa + Intradía + Swing + Largo Plazo)
             if not df_raw.empty:
-                st.markdown("<h2 class='custom-header'>Scanner de Contratos Frontales (Top OI & Vol)</h2>", unsafe_allow_html=True)
-                
-                # Preparar datos de contratos
-                df_contracts = df_raw.copy()
-                df_contracts['contract_type'] = df_contracts['type'].apply(lambda t: 'call' if t == 'C' else 'put')
-                
-                # Calcular ITM_State
-                df_contracts['ITM_State'] = df_contracts.apply(
-                    lambda r: 'ITM' if (r['contract_type'] == 'call' and r['strike'] < res['Spot Price']) or 
-                                      (r['contract_type'] == 'put' and r['strike'] > res['Spot Price']) 
-                              else 'OTM',
-                    axis=1
+                st.markdown("<h2 class='custom-header'>Scanner de Contratos (Top OI &amp; Volume)</h2>", unsafe_allow_html=True)
+
+                full_sc_records = df_raw.attrs.get("full_chain_scanner") if hasattr(df_raw, "attrs") else None
+                using_full_chain = isinstance(full_sc_records, list) and len(full_sc_records) > 0
+                df_contracts = pd.DataFrame(full_sc_records) if using_full_chain else df_raw.copy()
+
+                df_contracts["contract_type"] = df_contracts["type"].apply(lambda t: "call" if t == "C" else "put")
+                df_contracts["strike"] = pd.to_numeric(df_contracts["strike"], errors="coerce").fillna(0.0)
+                df_contracts["dte"] = pd.to_numeric(df_contracts["dte"], errors="coerce").fillna(0).astype(int)
+                df_contracts["open_interest"] = pd.to_numeric(df_contracts["open_interest"], errors="coerce").fillna(0).astype(int)
+                df_contracts["volume"] = pd.to_numeric(df_contracts["volume"], errors="coerce").fillna(0).astype(int)
+                df_contracts["delta"] = pd.to_numeric(df_contracts["delta"], errors="coerce").fillna(0.0)
+                if "net_gex" not in df_contracts.columns:
+                    df_contracts["net_gex"] = 0.0
+                else:
+                    df_contracts["net_gex"] = pd.to_numeric(df_contracts["net_gex"], errors="coerce").fillna(0.0)
+                if "vol_gex" not in df_contracts.columns:
+                    df_contracts["vol_gex"] = 0.0
+                else:
+                    df_contracts["vol_gex"] = pd.to_numeric(df_contracts["vol_gex"], errors="coerce").fillna(0.0)
+
+                spot_sc = float(res["Spot Price"])
+                df_contracts["ITM_State"] = df_contracts.apply(
+                    lambda r: "ITM" if (r["contract_type"] == "call" and r["strike"] < spot_sc)
+                    or (r["contract_type"] == "put" and r["strike"] > spot_sc)
+                    else "OTM",
+                    axis=1,
                 )
-                
-                # Seleccionar columnas y filtrar top 10 por OI + Volumen
-                df_contracts['oi_vol_sum'] = df_contracts['open_interest'] + df_contracts['volume']
-                df_scanner = df_contracts.nlargest(10, 'oi_vol_sum')[
-                    ['contract_type', 'strike', 'dte', 'open_interest', 'volume', 'delta', 'ITM_State']
-                ].copy()
-                
-                # Formatear números en la tabla para legibilidad
-                df_scanner['open_interest'] = df_scanner['open_interest'].astype(int)
-                df_scanner['volume'] = df_scanner['volume'].astype(int)
-                df_scanner['strike'] = df_scanner['strike'].astype(float)
-                df_scanner['dte'] = df_scanner['dte'].astype(int)
-                
-                # Aplicar color morado de fondo a las filas de tipo 'put', y negro/oscuro a las de 'call'
-                def style_row_by_type(row):
-                    color = '#2d1b4e' if row['contract_type'] == 'put' else '#0b0d10'
-                    return [f'background-color: {color}'] * len(row)
-                    
-                styled_df = df_scanner.style.apply(style_row_by_type, axis=1)
-                
-                st.dataframe(styled_df, use_container_width=True, hide_index=True)
+                df_contracts["oi_vol_sum"] = df_contracts["open_interest"] + df_contracts["volume"]
+                df_contracts["intra_score"] = df_contracts["volume"] * 2 + df_contracts["open_interest"]
+
+                def _sc_vol_cell(val, rank, is_call):
+                    txt = f"{int(val):,}"
+                    if is_call:
+                        if rank == 1:
+                            return f'<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:800;background:rgba(0,230,118,0.34);border:1.5px solid #00e676;color:#ffffff;">{txt}</span>'
+                        if rank == 2:
+                            return f'<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:700;background:rgba(46,204,113,0.18);border:1px solid rgba(46,204,113,0.65);color:#e6edf3;">{txt}</span>'
+                        if rank == 3:
+                            return f'<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:600;background:rgba(46,204,113,0.08);border:1px solid rgba(46,204,113,0.34);color:#b0bac5;">{txt}</span>'
+                    else:
+                        if rank == 1:
+                            return f'<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:800;background:rgba(255,59,48,0.36);border:1.5px solid #ff3b30;color:#ffffff;">{txt}</span>'
+                        if rank == 2:
+                            return f'<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:700;background:rgba(255,77,77,0.18);border:1px solid rgba(255,77,77,0.65);color:#e6edf3;">{txt}</span>'
+                        if rank == 3:
+                            return f'<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:600;background:rgba(255,77,77,0.08);border:1px solid rgba(255,77,77,0.34);color:#b0bac5;">{txt}</span>'
+                    return f'<span style="color:#c9d1d9;">{txt}</span>'
+
+                def _sc_oi_cell(val, rank, is_call):
+                    txt = f"{int(val):,}"
+                    if is_call:
+                        if rank == 1:
+                            return f'<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:700;background:rgba(56,189,248,0.16);border:1.5px solid #38bdf8;color:#e0f2fe;">{txt}</span>'
+                        if rank == 2:
+                            return f'<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:600;border:1px solid rgba(56,189,248,0.55);color:#bae6fd;">{txt}</span>'
+                        if rank == 3:
+                            return f'<span style="display:inline-block;padding:2px 6px;border-radius:4px;border:1px solid rgba(56,189,248,0.28);color:#94a3b8;">{txt}</span>'
+                    else:
+                        if rank == 1:
+                            return f'<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:700;background:rgba(251,191,36,0.16);border:1.5px solid #fbbf24;color:#fef3c7;">{txt}</span>'
+                        if rank == 2:
+                            return f'<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:600;border:1px solid rgba(251,191,36,0.55);color:#fde68a;">{txt}</span>'
+                        if rank == 3:
+                            return f'<span style="display:inline-block;padding:2px 6px;border-radius:4px;border:1px solid rgba(251,191,36,0.28);color:#94a3b8;">{txt}</span>'
+                    return f'<span style="color:#8b949e;">{txt}</span>'
+
+                def _render_contract_scanner_tab(df_sub, banner_left, banner_right, footnote_txt):
+                    if df_sub.empty:
+                        st.info("No hay contratos activos en este horizonte para el ticker seleccionado.")
+                        return
+
+                    df_top = df_sub.reset_index(drop=True)
+
+                    # Top 3 Volume y Top 3 OI por tipo (Calls y Puts por separado)
+                    def _ranks_by_type(df_t, col_n, ctype):
+                        sub_t = df_t[(df_t["contract_type"] == ctype) & (df_t[col_n] > 0)].sort_values(col_n, ascending=False).head(3)
+                        return {idx_t: rnk for rnk, idx_t in enumerate(sub_t.index.tolist(), start=1)}
+
+                    cv_ranks = _ranks_by_type(df_top, "volume", "call")
+                    pv_ranks = _ranks_by_type(df_top, "volume", "put")
+                    co_ranks = _ranks_by_type(df_top, "open_interest", "call")
+                    po_ranks = _ranks_by_type(df_top, "open_interest", "put")
+
+                    # Detectar posibles Spreads (mismo tipo, mismo DTE, strike distinto, volumen >= 1000 y similitud >= 88%)
+                    spread_indices = set()
+                    n_rows = len(df_top)
+                    for i_a in range(n_rows):
+                        va = int(df_top.at[i_a, "volume"])
+                        if va < 1000:
+                            continue
+                        for i_b in range(i_a + 1, n_rows):
+                            vb = int(df_top.at[i_b, "volume"])
+                            if vb < 1000:
+                                continue
+                            if (
+                                df_top.at[i_a, "contract_type"] == df_top.at[i_b, "contract_type"]
+                                and int(df_top.at[i_a, "dte"]) == int(df_top.at[i_b, "dte"])
+                                and float(df_top.at[i_a, "strike"]) != float(df_top.at[i_b, "strike"])
+                                and (min(va, vb) / max(va, vb)) >= 0.88
+                            ):
+                                spread_indices.add(i_a)
+                                spread_indices.add(i_b)
+
+                    st.markdown(
+                        '<div style="background:#161b22;border:1px solid #30363d;border-radius:7px;padding:7px 11px;'
+                        'margin-bottom:7px;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;font-size:12.5px;">'
+                        f'<span style="color:#e6edf3;">{banner_left}</span>'
+                        f'<span style="color:#8b949e;font-size:12px;">{banner_right}</span>'
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    rows_html = ""
+                    for idx_r, rr in df_top.iterrows():
+                        is_call = rr["contract_type"] == "call"
+                        type_pill = (
+                            '<span style="display:inline-block;padding:2px 7px;border-radius:4px;font-weight:800;font-size:11.5px;'
+                            'background:rgba(34,197,94,0.16);color:#4ade80;border:1px solid rgba(34,197,94,0.45);">CALL</span>'
+                            if is_call else
+                            '<span style="display:inline-block;padding:2px 7px;border-radius:4px;font-weight:800;font-size:11.5px;'
+                            'background:rgba(239,68,68,0.16);color:#f87171;border:1px solid rgba(239,68,68,0.45);">PUT</span>'
+                        )
+                        strike_str = f"${float(rr['strike']):g}"
+                        dte_str = f"{int(rr['dte'])}d"
+                        oi_v = int(rr["open_interest"])
+                        vol_v = int(rr["volume"])
+                        delta_v = float(rr["delta"])
+                        delta_str = f"{delta_v:+.2f}"
+
+                        oi_rank = co_ranks.get(idx_r, 0) if is_call else po_ranks.get(idx_r, 0)
+                        vol_rank = cv_ranks.get(idx_r, 0) if is_call else pv_ranks.get(idx_r, 0)
+
+                        # Ratio Vol/OI y bandera de flujo nuevo
+                        is_hot_ratio = False
+                        if oi_v == 0 and vol_v >= 100:
+                            ratio_html = (
+                                '<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:700;font-size:11.5px;'
+                                'background:rgba(251,146,60,0.18);color:#fb923c;border:1px solid rgba(251,146,60,0.45);">🔥 NUEVO</span>'
+                            )
+                        elif oi_v > 0:
+                            ratio_val = vol_v / oi_v
+                            if ratio_val >= 1.0 and vol_v >= 500:
+                                is_hot_ratio = True
+                                ratio_html = (
+                                    f'<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:700;font-size:11.5px;'
+                                    f'background:rgba(251,146,60,0.18);color:#fb923c;border:1px solid rgba(251,146,60,0.45);">{ratio_val:.2f}x</span>'
+                                )
+                            else:
+                                ratio_html = f'<span style="color:#8b949e;">{ratio_val:.2f}x</span>'
+                        else:
+                            ratio_html = '<span style="color:#8b949e;">0.00x</span>'
+
+                        # GEX oficial (basado en OI) o estimado (~) con Volume si OI == 0
+                        ng_val = float(rr["net_gex"])
+                        vg_val = float(rr["vol_gex"])
+                        if oi_v > 0 and abs(ng_val) > 0:
+                            gex_clr = "#2ecc71" if ng_val > 0 else "#ff4d4d"
+                            gex_fmt = format_millions(ng_val, engine_mode)
+                            gex_txt = f"+{gex_fmt}" if (ng_val > 0 and not gex_fmt.startswith("+")) else gex_fmt
+                            gex_html = f'<span style="color:{gex_clr};font-weight:700;">{gex_txt}</span>'
+                        elif oi_v == 0 and vol_v > 0 and abs(vg_val) > 0:
+                            gex_fmt = format_millions(vg_val, engine_mode)
+                            gex_txt = f"~+{gex_fmt}" if (vg_val > 0 and not gex_fmt.startswith("+")) else f"~{gex_fmt}"
+                            gex_html = f'<span title="Estimado con Volume de hoy (OI = 0)" style="color:#94a3b8;font-style:italic;">{gex_txt}</span>'
+                        else:
+                            gex_html = f'<span style="color:#6e7681;">{format_millions(0, engine_mode)}</span>'
+
+                        # Estado ITM/OTM + badges (Spread / Nuevo)
+                        itm_st = rr["ITM_State"]
+                        itm_pill = (
+                            '<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:700;font-size:11px;'
+                            'background:rgba(56,189,248,0.15);color:#38bdf8;border:1px solid rgba(56,189,248,0.38);">ITM</span>'
+                            if itm_st == "ITM" else
+                            '<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-size:11px;'
+                            'background:rgba(148,163,184,0.10);color:#8b949e;border:1px solid #30363d;">OTM</span>'
+                        )
+                        extra_pills = ""
+                        if idx_r in spread_indices:
+                            extra_pills += (
+                                ' <span title="Mismo tipo, mismo DTE y volumen espejo (>88%)" '
+                                'style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:700;font-size:11px;'
+                                'background:rgba(168,85,247,0.18);color:#c084fc;border:1px solid rgba(168,85,247,0.45);">🔀 Spread</span>'
+                            )
+                        elif is_hot_ratio:
+                            extra_pills += (
+                                ' <span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:700;font-size:11px;'
+                                'background:rgba(251,146,60,0.18);color:#fb923c;border:1px solid rgba(251,146,60,0.45);">🔥 Nuevo</span>'
+                            )
+
+                        rows_html += (
+                            '<tr style="border-bottom:1px solid #21262d;">'
+                            f'<td style="padding:6px 7px;text-align:left;white-space:nowrap;">{type_pill}</td>'
+                            f'<td style="padding:6px 7px;text-align:left;font-weight:800;color:#ffffff;white-space:nowrap;">{strike_str}</td>'
+                            f'<td style="padding:6px 6px;text-align:center;color:#8b949e;white-space:nowrap;">{dte_str}</td>'
+                            f'<td style="padding:6px 7px;text-align:right;white-space:nowrap;">{_sc_oi_cell(oi_v, oi_rank, is_call)}</td>'
+                            f'<td style="padding:6px 7px;text-align:right;white-space:nowrap;">{_sc_vol_cell(vol_v, vol_rank, is_call)}</td>'
+                            f'<td style="padding:6px 6px;text-align:center;white-space:nowrap;">{ratio_html}</td>'
+                            f'<td style="padding:6px 6px;text-align:right;color:#c9d1d9;white-space:nowrap;">{delta_str}</td>'
+                            f'<td style="padding:6px 7px;text-align:right;white-space:nowrap;">{gex_html}</td>'
+                            f'<td style="padding:6px 7px;text-align:right;white-space:nowrap;">{itm_pill}{extra_pills}</td>'
+                            '</tr>'
+                        )
+
+                    tbl_html = (
+                        '<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;overflow:hidden;margin-bottom:6px;">'
+                        '<table style="width:100%;border-collapse:collapse;font-size:12.5px;font-family:\'Inter\',sans-serif;font-variant-numeric:tabular-nums;">'
+                        '<thead><tr style="background:#161b22;border-bottom:1px solid #30363d;color:#8b949e;">'
+                        '<th style="padding:7px 7px;text-align:left;">Tipo</th>'
+                        '<th style="padding:7px 7px;text-align:left;">Strike</th>'
+                        '<th style="padding:7px 6px;text-align:center;">DTE</th>'
+                        '<th style="padding:7px 7px;text-align:right;">OI</th>'
+                        '<th style="padding:7px 7px;text-align:right;">Volume</th>'
+                        '<th style="padding:7px 6px;text-align:center;">Vol/OI</th>'
+                        '<th style="padding:7px 6px;text-align:right;">Delta</th>'
+                        '<th style="padding:7px 7px;text-align:right;">GEX</th>'
+                        '<th style="padding:7px 7px;text-align:right;">Estado / Señal</th>'
+                        '</tr></thead>'
+                        f'<tbody>{rows_html}</tbody>'
+                        '</table></div>'
+                    )
+                    st.markdown(tbl_html, unsafe_allow_html=True)
+                    st.caption(footnote_txt)
+
+                source_tag = "Cadena completa" if using_full_chain else "Fechas seleccionadas"
+                tab_sc_all, tab_sc_intra, tab_sc_swing, tab_sc_leaps = st.tabs([
+                    "🌐 Todos (Completa)",
+                    "⚡ Intradía (0–7d)",
+                    "📈 Swing (8–60d)",
+                    "🏛️ Largo Plazo (>60d)",
+                ])
+
+                with tab_sc_all:
+                    _render_contract_scanner_tab(
+                        df_contracts.nlargest(10, "oi_vol_sum"),
+                        "<b>🌐 Vista Completa (Top 10 OI + Volume)</b> · Todos los vencimientos combinados",
+                        f"Top 10 · {source_tag}",
+                        "💡 **~** en GEX = estimado con Volume de hoy porque `OI = 0` (mañana pasa a GEX oficial). Cajitas llenas = Top 3 Volume (verde Calls / rojo Puts) · Bordes = Top 3 OI (cian Calls / ámbar Puts) · **🔀 Spread** = mismo tipo/DTE y volumen espejo.",
+                    )
+
+                with tab_sc_intra:
+                    df_sc_intra = df_contracts[df_contracts["dte"] <= 7].nlargest(10, "intra_score")
+                    _render_contract_scanner_tab(
+                        df_sc_intra,
+                        "<b>⚡ Intradía / Scalping (0–7 DTE)</b> · Prioriza Volume activo + GEX de hoy",
+                        f"Top {len(df_sc_intra)} · 0–7 DTE · {source_tag}",
+                        "💡 En **0–7 DTE** mandan **Volume**, **Vol/OI ≥ 1.0x** y **GEX**: muestran dónde los dealers están ajustando cobertura hoy.",
+                    )
+
+                with tab_sc_swing:
+                    df_sc_swing = df_contracts[(df_contracts["dte"] >= 8) & (df_contracts["dte"] <= 60)].nlargest(10, "oi_vol_sum")
+                    _render_contract_scanner_tab(
+                        df_sc_swing,
+                        "<b>📈 Swing (8–60 DTE)</b> · Posicionamiento semanal/mensual, flujo nuevo y Spreads",
+                        f"Top {len(df_sc_swing)} · 8–60 DTE · {source_tag}",
+                        "💡 Ideal para detectar apuestas institucionales de 2–8 semanas y **🔀 Spreads** sin ruido de 0DTE ni LEAPS.",
+                    )
+
+                with tab_sc_leaps:
+                    df_sc_leaps = df_contracts[df_contracts["dte"] > 60].nlargest(10, "oi_vol_sum")
+                    _render_contract_scanner_tab(
+                        df_sc_leaps,
+                        "<b>🏛️ Largo Plazo / LEAPS (&gt;60 DTE)</b> · Muros estructurales y coberturas de fondos",
+                        f"Top {len(df_sc_leaps)} · >60 DTE · {source_tag}",
+                        "💡 Úsalos como **mapa macro** de pisos y techos institucionales a varios meses (aquí manda **OI + Delta** más que el GEX diario).",
+                    )
 else:
     st.info("💡 Haz clic en 'Descargar Data' para cargar las fechas de expiración disponibles y comenzar.")
