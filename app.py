@@ -72,17 +72,24 @@ get_macro_climate = getattr(
 fetch_discord_whales = getattr(
     gex_engine,
     "fetch_discord_whales",
-    lambda bot_token, channel_ids, limit=50: {"golden": [], "sweeps": [], "dark_pool": [], "errors": {}},
+    lambda bot_token, channel_ids, days=1, limit=None: {"golden": [], "sweeps": [], "dark_pool": [], "errors": {}, "days": days},
 )
 
 # Funciones con caché para optimizar consultas de la API (60s para datos en vivo)
 @st.cache_data(ttl=60)
-def cached_discord_whales(bot_token, golden_id, sweeps_id, darkpool_id, limit=50):
-    return fetch_discord_whales(
-        bot_token,
-        {"golden": golden_id, "sweeps": sweeps_id, "dark_pool": darkpool_id},
-        limit=limit,
-    )
+def cached_discord_whales(bot_token, golden_id, sweeps_id, darkpool_id, days=1):
+    try:
+        return fetch_discord_whales(
+            bot_token,
+            {"golden": golden_id, "sweeps": sweeps_id, "dark_pool": darkpool_id},
+            days=days,
+        )
+    except TypeError:
+        return fetch_discord_whales(
+            bot_token,
+            {"golden": golden_id, "sweeps": sweeps_id, "dark_pool": darkpool_id},
+            limit=100,
+        )
 
 @st.cache_data(ttl=300)
 def cached_macro_climate(api_key):
@@ -518,32 +525,39 @@ except Exception:
 _disc_configured = bool(_disc_token and (_disc_golden_id or _disc_sweeps_id or _disc_dp_id))
 
 if _disc_configured:
-    _dw_data = cached_discord_whales(_disc_token, _disc_golden_id, _disc_sweeps_id, _disc_dp_id, limit=50)
+    _dw_range_opts = ["Hoy", "3 días", "1 semana", "2 semanas"]
+    _dw_range_map = {"Hoy": 1, "3 días": 3, "1 semana": 7, "2 semanas": 14}
+    _dw_range_cur = st.session_state.get("dw_range_flt", "Hoy")
+    if _dw_range_cur not in _dw_range_map:
+        _dw_range_cur = "Hoy"
+    _dw_days = _dw_range_map[_dw_range_cur]
+
+    _dw_data = cached_discord_whales(_disc_token, _disc_golden_id, _disc_sweeps_id, _disc_dp_id, days=_dw_days)
     _dw_golden = _dw_data.get("golden", [])
     _dw_sweeps = _dw_data.get("sweeps", [])
     _dw_dp = _dw_data.get("dark_pool", [])
     _dw_errors = _dw_data.get("errors", {})
 
-    _g_today = [x for x in _dw_golden if x.get("is_today")]
-    _top_ref = (_g_today[0] if _g_today else (_dw_golden[0] if _dw_golden else (_dw_sweeps[0] if _dw_sweeps else None)))
-    _n_alerts = len(_g_today) if _g_today else (len(_dw_golden) + len(_dw_sweeps))
+    _g_win = [x for x in _dw_golden if x.get("in_window", x.get("is_today"))]
+    _top_ref = (_g_win[0] if _g_win else (_dw_golden[0] if _dw_golden else (_dw_sweeps[0] if _dw_sweeps else None)))
+    _n_alerts = len(_g_win) if _g_win else (len(_dw_golden) + len(_dw_sweeps))
     if _top_ref:
         _top_p = format_millions(_top_ref.get("prem_usd", 0.0), "USD")
         _top_hits = f" ({_top_ref['hits']}x)" if _top_ref.get("hits", 1) > 1 else ""
-        _exp_label = f"🐋 Ballenas Hoy (Tu Discord en Vivo) · ● Conectado · {_n_alerts} alertas · Top: {_top_ref['ticker']} {_top_p}{_top_hits}"
+        _exp_label = f"🐋 Ballenas ({_dw_range_cur} · Tu Discord en Vivo) · ● Conectado · {_n_alerts} alertas · Top: {_top_ref['ticker']} {_top_p}{_top_hits}"
     else:
-        _exp_label = "🐋 Ballenas Hoy (Tu Discord en Vivo) · ● Conectado"
+        _exp_label = f"🐋 Ballenas ({_dw_range_cur} · Tu Discord en Vivo) · ● Conectado"
 
     with st.expander(_exp_label, expanded=False):
-        c_dw1, c_dw2, c_dw3, c_dw4 = st.columns([1.4, 1.8, 1.8, 1.4])
+        c_dw1, c_dw2, c_dw3, c_dw4 = st.columns([1.6, 1.7, 1.7, 1.4])
         with c_dw1:
-            _dw_only_today = st.checkbox("Solo hoy", value=True, key="dw_only_today")
+            _dw_range_lbl = st.selectbox("Ventana", _dw_range_opts, key="dw_range_flt", label_visibility="collapsed")
         with c_dw2:
             _dw_side = st.selectbox("Tipo", ["Todos", "Solo Calls", "Solo Puts"], key="dw_side_flt", label_visibility="collapsed")
         with c_dw3:
             _dw_min_prem_lbl = st.selectbox("Prima mínima", ["Prima: Todas", "≥ $250K", "≥ $500K", "≥ $1M"], key="dw_prem_flt", label_visibility="collapsed")
         with c_dw4:
-            if st.button("🔄 Refrescar Discord", use_container_width=True, key="dw_refresh_btn"):
+            if st.button("🔄 Refrescar", use_container_width=True, key="dw_refresh_btn"):
                 cached_discord_whales.clear()
                 st.rerun()
 
@@ -557,11 +571,9 @@ if _disc_configured:
                 st.info(f"Sin alertas recientes en {ch_title}.")
                 return
 
-            filtered = [x for x in items if (not _dw_only_today or x.get("is_today"))]
-            showing_recent_fallback = False
-            if not filtered and _dw_only_today:
-                filtered = items[:]
-                showing_recent_fallback = True
+            in_win_list = [x for x in items if x.get("in_window", x.get("is_today"))]
+            showing_recent_fallback = len(in_win_list) == 0
+            filtered = in_win_list if in_win_list else items[:]
 
             if _dw_side == "Solo Calls":
                 filtered = [x for x in filtered if x.get("type") == "CALL"]
@@ -572,11 +584,11 @@ if _disc_configured:
 
             filtered = filtered[:20]
             if not filtered:
-                st.info("Ninguna alerta cumple el filtro actual (prueba bajar la prima mínima o desmarcar 'Solo hoy').")
+                st.info("Ninguna alerta cumple el filtro actual (prueba bajar la prima mínima o ampliar la ventana).")
                 return
 
             tot_prem = sum(float(x.get("prem_usd", 0.0)) for x in filtered)
-            note_txt = " · mostrando últimas recientes (sin alertas hoy todavía)" if showing_recent_fallback else ""
+            note_txt = " · mostrando últimas recientes (sin alertas hoy todavía)" if showing_recent_fallback else f" · acumulado {_dw_range_lbl}"
             st.markdown(
                 '<div style="background:#161b22;border:1px solid #30363d;border-radius:7px;padding:6px 10px;margin-bottom:6px;'
                 'display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;font-size:12px;">'
@@ -601,9 +613,11 @@ if _disc_configured:
                 p_clr = "#fde047" if p_usd >= 1_000_000 else ("#e6edf3" if p_usd >= 500_000 else "#c9d1d9")
                 p_wt = "800" if p_usd >= 1_000_000 else "600"
                 hits_n = int(r.get("hits", 1))
+                days_act = int(r.get("days_active", 1))
+                days_tag = f" · {days_act}d" if days_act > 1 else ""
                 hits_h = (
-                    f'<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:700;font-size:11px;'
-                    f'background:rgba(168,85,247,0.18);color:#c084fc;border:1px solid rgba(168,85,247,0.45);">{hits_n}x 🔥</span>'
+                    f'<span title="Acumulado en {days_act} día(s)" style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:700;font-size:11px;'
+                    f'background:rgba(168,85,247,0.18);color:#c084fc;border:1px solid rgba(168,85,247,0.45);">{hits_n}x 🔥{days_tag}</span>'
                     if hits_n > 1 else '<span style="color:#8b949e;">1x</span>'
                 )
                 tag_h = (
@@ -611,7 +625,8 @@ if _disc_configured:
                     'background:rgba(245,158,11,0.20);color:#fbbf24;border:1px solid rgba(245,158,11,0.55);">🥇 Golden</span>'
                     if r.get("is_golden") else '<span style="color:#8b949e;">⚡ Sweep</span>'
                 )
-                date_badge = "" if r.get("is_today") else f" <span style='color:#6e7681;font-size:10.5px;'>{r.get('date_str','')[5:]}</span>"
+                show_date = (_dw_days > 1) or (not r.get("is_today"))
+                date_prefix = f"<span style='color:#6e7681;font-size:10.5px;'>{r.get('date_str','')[5:]}</span> " if show_date and r.get("date_str") else ""
                 rows_h += (
                     '<tr style="border-bottom:1px solid #21262d;">'
                     f'<td style="padding:5px 7px;text-align:left;font-weight:800;color:#ffffff;white-space:nowrap;">{r["ticker"]}</td>'
@@ -621,7 +636,7 @@ if _disc_configured:
                     f'<td style="padding:5px 7px;text-align:right;font-weight:{p_wt};color:{p_clr};white-space:nowrap;">{format_millions(p_usd, "USD")}</td>'
                     f'<td style="padding:5px 6px;text-align:center;white-space:nowrap;">{hits_h}</td>'
                     f'<td style="padding:5px 6px;text-align:center;white-space:nowrap;">{tag_h}</td>'
-                    f'<td style="padding:5px 7px;text-align:right;color:#8b949e;white-space:nowrap;">{r["time_str"]}{date_badge}</td>'
+                    f'<td style="padding:5px 7px;text-align:right;color:#8b949e;white-space:nowrap;">{date_prefix}{r["time_str"]}</td>'
                     '</tr>'
                 )
 
@@ -636,7 +651,7 @@ if _disc_configured:
                 '<th style="padding:6px 7px;text-align:right;">Prima Total</th>'
                 '<th style="padding:6px 6px;text-align:center;">Golpes</th>'
                 '<th style="padding:6px 6px;text-align:center;">Señal</th>'
-                '<th style="padding:6px 7px;text-align:right;">Hora</th>'
+                '<th style="padding:6px 7px;text-align:right;">Hora (PT)</th>'
                 '</tr></thead>'
                 f'<tbody>{rows_h}</tbody></table></div>',
                 unsafe_allow_html=True,
@@ -669,11 +684,9 @@ if _disc_configured:
                 st.info("Sin bloques recientes en #dark-pool.")
                 return
 
-            filtered = [x for x in items if (not _dw_only_today or x.get("is_today"))]
-            showing_recent_fallback = False
-            if not filtered and _dw_only_today:
-                filtered = items[:]
-                showing_recent_fallback = True
+            in_win_list = [x for x in items if x.get("in_window", x.get("is_today"))]
+            showing_recent_fallback = len(in_win_list) == 0
+            filtered = in_win_list if in_win_list else items[:]
             if _dw_min_prem > 0:
                 filtered = [x for x in filtered if float(x.get("amount_usd", 0.0)) >= _dw_min_prem]
 
@@ -682,7 +695,7 @@ if _disc_configured:
                 st.info("Ningún bloque Dark Pool cumple el filtro actual.")
                 return
 
-            note_txt = " · mostrando últimos recientes" if showing_recent_fallback else ""
+            note_txt = " · mostrando últimos recientes" if showing_recent_fallback else f" · {_dw_range_lbl}"
             st.markdown(
                 '<div style="background:#161b22;border:1px solid #30363d;border-radius:7px;padding:6px 10px;margin-bottom:6px;'
                 'display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;font-size:12px;">'
@@ -697,7 +710,8 @@ if _disc_configured:
                 amt_v = float(r.get("amount_usd", 0.0))
                 amt_disp = format_millions(amt_v, "USD") if amt_v > 0 else r.get("amount_str", "-")
                 fp_disp = r.get("float_pct") or "-"
-                date_badge = "" if r.get("is_today") else f" <span style='color:#6e7681;font-size:10.5px;'>{r.get('date_str','')[5:]}</span>"
+                show_date = (_dw_days > 1) or (not r.get("is_today"))
+                date_prefix = f"<span style='color:#6e7681;font-size:10.5px;'>{r.get('date_str','')[5:]}</span> " if show_date and r.get("date_str") else ""
                 rows_h += (
                     '<tr style="border-bottom:1px solid #21262d;">'
                     f'<td style="padding:5px 7px;text-align:left;font-weight:800;color:#ffffff;white-space:nowrap;">{r["ticker"]}</td>'
@@ -705,7 +719,7 @@ if _disc_configured:
                     f'<td style="padding:5px 7px;text-align:right;color:#c9d1d9;white-space:nowrap;">{r["shares_str"]}</td>'
                     f'<td style="padding:5px 7px;text-align:right;font-weight:800;color:#38bdf8;white-space:nowrap;">{amt_disp}</td>'
                     f'<td style="padding:5px 6px;text-align:center;color:#94a3b8;white-space:nowrap;">{fp_disp}</td>'
-                    f'<td style="padding:5px 7px;text-align:right;color:#8b949e;white-space:nowrap;">{r["time_str"]}{date_badge}</td>'
+                    f'<td style="padding:5px 7px;text-align:right;color:#8b949e;white-space:nowrap;">{date_prefix}{r["time_str"]}</td>'
                     '</tr>'
                 )
 
@@ -718,7 +732,7 @@ if _disc_configured:
                 '<th style="padding:6px 7px;text-align:right;">Acciones</th>'
                 '<th style="padding:6px 7px;text-align:right;">Monto Total</th>'
                 '<th style="padding:6px 6px;text-align:center;">% Float</th>'
-                '<th style="padding:6px 7px;text-align:right;">Hora</th>'
+                '<th style="padding:6px 7px;text-align:right;">Hora (PT)</th>'
                 '</tr></thead>'
                 f'<tbody>{rows_h}</tbody></table></div>',
                 unsafe_allow_html=True,

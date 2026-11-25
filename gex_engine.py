@@ -1213,8 +1213,8 @@ def _parse_money_suffix(raw_txt):
     return val * mult
 
 
-def _discord_fetch_messages(channel_id, bot_token, limit=50, timeout=10):
-    """Descarga los últimos mensajes de un canal de Discord usando Bot Token (solo lectura)."""
+def _discord_fetch_messages(channel_id, bot_token, max_messages=100, cutoff_epoch=None, timeout=10):
+    """Descarga mensajes recientes de un canal de Discord (con paginación segura) usando Bot Token."""
     import json
     import urllib.error
     import urllib.request
@@ -1224,36 +1224,69 @@ def _discord_fetch_messages(channel_id, bot_token, limit=50, timeout=10):
     if not cid or not tok:
         return [], None
 
-    url = f"https://discord.com/api/v10/channels/{cid}/messages?limit={min(max(int(limit), 1), 100)}"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bot {tok}",
-            "Accept": "application/json",
-            "User-Agent": "DiscordBot (https://github.com/carlosoco66-hash/gex-scanner, 1.0)",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return (data if isinstance(data, list) else []), None
-    except urllib.error.HTTPError as e:
+    collected = []
+    before_id = None
+    remaining = max(int(max_messages), 1)
+
+    while remaining > 0:
+        batch_size = min(remaining, 100)
+        url = f"https://discord.com/api/v10/channels/{cid}/messages?limit={batch_size}"
+        if before_id:
+            url += f"&before={before_id}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bot {tok}",
+                "Accept": "application/json",
+                "User-Agent": "DiscordBot (https://github.com/carlosoco66-hash/gex-scanner, 1.0)",
+            },
+        )
         try:
-            body = e.read().decode("utf-8", errors="ignore")[:180]
-        except Exception:
-            body = ""
-        return [], f"HTTP {e.code}: {body or e.reason}"
-    except Exception as e:
-        return [], str(e)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                batch = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if collected:
+                break
+            try:
+                body = e.read().decode("utf-8", errors="ignore")[:180]
+            except Exception:
+                body = ""
+            return [], f"HTTP {e.code}: {body or e.reason}"
+        except Exception as e:
+            if collected:
+                break
+            return [], str(e)
+
+        if not isinstance(batch, list) or not batch:
+            break
+
+        collected.extend(batch)
+        remaining -= len(batch)
+        before_id = batch[-1].get("id")
+
+        if len(batch) < batch_size or not before_id:
+            break
+
+        if cutoff_epoch is not None:
+            try:
+                oldest_ts = datetime.datetime.fromisoformat(
+                    str(batch[-1].get("timestamp", "")).replace("Z", "+00:00")
+                ).timestamp()
+                if oldest_ts < cutoff_epoch:
+                    break
+            except Exception:
+                pass
+
+    return collected, None
 
 
-def fetch_discord_whales(bot_token, channel_ids, limit=50):
+def fetch_discord_whales(bot_token, channel_ids, days=1, limit=None):
     """
     Lee alertas de Tradytics desde tus canales privados de Discord:
       - golden (#golden-sweeps)
       - sweeps (#options-sweeps)
       - dark_pool (#dark-pool)
-    Agrupa golpes repetidos en el mismo contrato para sweeps y devuelve listas ordenadas.
+    Convierte todas las horas a Pacífico (PT) y agrupa golpes acumulados en el rango elegido (1, 3, 7 o 14 días).
     """
     import re
     try:
@@ -1264,10 +1297,24 @@ def fetch_discord_whales(bot_token, channel_ids, limit=50):
         tz_pt = datetime.timezone(datetime.timedelta(hours=-8))
         tz_et = datetime.timezone(datetime.timedelta(hours=-5))
 
-    today_pt = datetime.datetime.now(tz_pt).date()
+    now_pt = datetime.datetime.now(tz_pt)
+    today_pt = now_pt.date()
     today_et = datetime.datetime.now(tz_et).date()
 
-    out = {"golden": [], "sweeps": [], "dark_pool": [], "errors": {}}
+    days_int = max(int(days or 1), 1)
+    cutoff_date_pt = today_pt - datetime.timedelta(days=days_int - 1)
+    cutoff_dt_pt = datetime.datetime(
+        cutoff_date_pt.year, cutoff_date_pt.month, cutoff_date_pt.day, 0, 0, 0, tzinfo=tz_pt
+    )
+    # Margen de 12h para no cortar mensajes por diferencia ET/PT al paginar
+    cutoff_epoch = cutoff_dt_pt.timestamp() - 43200.0
+
+    if limit is not None:
+        max_msgs = max(int(limit), 50)
+    else:
+        max_msgs = {1: 100, 3: 250, 7: 400, 14: 500}.get(days_int, min(max(days_int * 60, 100), 500))
+
+    out = {"golden": [], "sweeps": [], "dark_pool": [], "errors": {}, "days": days_int}
     if not bot_token or not isinstance(channel_ids, dict):
         return out
 
@@ -1276,12 +1323,12 @@ def fetch_discord_whales(bot_token, channel_ids, limit=50):
             dt_utc = datetime.datetime.fromisoformat(str(ts_iso).replace("Z", "+00:00"))
             return dt_utc.astimezone(tz_pt), dt_utc.astimezone(tz_et), dt_utc.timestamp()
         except Exception:
-            now_pt = datetime.datetime.now(tz_pt)
-            now_et = datetime.datetime.now(tz_et)
-            return now_pt, now_et, now_pt.timestamp()
+            n_pt = datetime.datetime.now(tz_pt)
+            n_et = datetime.datetime.now(tz_et)
+            return n_pt, n_et, n_pt.timestamp()
 
     def _parse_sweep_channel(messages, default_golden=False):
-        grouped = {}
+        raw_hits = []
         for msg in messages:
             embeds = msg.get("embeds") or []
             dt_pt, dt_et, ts_epoch = _msg_dt_pt_et(msg.get("timestamp", ""))
@@ -1323,55 +1370,87 @@ def fetch_discord_whales(bot_token, channel_ids, limit=50):
                 prem_raw = fields.get("premiums") or fields.get("premium") or "0"
                 prem_usd = _parse_money_suffix(prem_raw)
 
-                if "put" in header_all:
-                    opt_type = "PUT"
-                elif "call" in header_all:
-                    opt_type = "CALL"
-                else:
-                    opt_type = "CALL"
-
+                opt_type = "PUT" if "put" in header_all else "CALL"
                 is_golden = ("golden" in header_all) or (default_golden and prem_usd >= 1_000_000)
 
+                # Convertir hora ET de Tradytics a Pacífico (PT) real
                 time_raw = str(fields.get("time") or "").strip()
-                trade_date = dt_et.date()
-                time_disp = dt_et.strftime("%H:%M ET")
-                m_dt = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})", time_raw)
+                trade_dt_pt = dt_pt
+                ts_trade = ts_epoch
+                m_dt = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})(?::(\d{2}))?", time_raw)
                 if m_dt:
                     try:
-                        trade_date = datetime.datetime.strptime(m_dt.group(1), "%Y-%m-%d").date()
+                        sec_v = int(m_dt.group(3) or 0)
+                        dt_naive = datetime.datetime.strptime(
+                            f"{m_dt.group(1)} {m_dt.group(2)}:{sec_v:02d}", "%Y-%m-%d %H:%M:%S"
+                        )
+                        trade_dt_pt = dt_naive.replace(tzinfo=tz_et).astimezone(tz_pt)
+                        ts_trade = trade_dt_pt.timestamp()
                     except Exception:
                         pass
-                    time_disp = f"{m_dt.group(2)} ET"
 
-                is_today = (trade_date == today_et) or (dt_pt.date() == today_pt)
-                g_key = (sym, opt_type, round(strike_val, 3), exp_disp, str(trade_date))
-                if g_key not in grouped:
-                    grouped[g_key] = {
-                        "ticker": sym,
-                        "type": opt_type,
-                        "strike": strike_val,
-                        "exp": exp_disp,
-                        "dte": dte_val,
-                        "prem_usd": prem_usd,
-                        "hits": 1,
-                        "is_golden": is_golden,
-                        "time_str": time_disp,
-                        "date_str": str(trade_date),
-                        "is_today": is_today,
-                        "ts_epoch": ts_epoch,
-                    }
-                else:
-                    rec = grouped[g_key]
-                    rec["prem_usd"] += prem_usd
-                    rec["hits"] += 1
-                    rec["is_golden"] = rec["is_golden"] or is_golden
-                    rec["is_today"] = rec["is_today"] or is_today
-                    if ts_epoch > rec["ts_epoch"]:
-                        rec["ts_epoch"] = ts_epoch
-                        rec["time_str"] = time_disp
+                trade_date_pt = trade_dt_pt.date()
+                in_window = trade_date_pt >= cutoff_date_pt
+                is_today = trade_date_pt == today_pt
 
-        items = list(grouped.values())
-        items.sort(key=lambda x: (x["is_today"], x["prem_usd"], x["ts_epoch"]), reverse=True)
+                raw_hits.append({
+                    "ticker": sym,
+                    "type": opt_type,
+                    "strike": strike_val,
+                    "exp": exp_disp,
+                    "dte": dte_val,
+                    "prem_usd": prem_usd,
+                    "is_golden": is_golden,
+                    "time_str": trade_dt_pt.strftime("%H:%M PT"),
+                    "date_str": str(trade_date_pt),
+                    "is_today": is_today,
+                    "in_window": in_window,
+                    "ts_epoch": ts_trade,
+                })
+
+        # Usar los que caen en la ventana elegida; si no hubiera ninguno hoy (ej. fin de semana), usar los recientes
+        in_win_hits = [h for h in raw_hits if h["in_window"]]
+        use_hits = in_win_hits if in_win_hits else raw_hits
+
+        grouped = {}
+        for h in use_hits:
+            g_key = (h["ticker"], h["type"], round(h["strike"], 3), h["exp"])
+            if g_key not in grouped:
+                grouped[g_key] = {
+                    "ticker": h["ticker"],
+                    "type": h["type"],
+                    "strike": h["strike"],
+                    "exp": h["exp"],
+                    "dte": h["dte"],
+                    "prem_usd": h["prem_usd"],
+                    "hits": 1,
+                    "days_set": {h["date_str"]},
+                    "is_golden": h["is_golden"],
+                    "time_str": h["time_str"],
+                    "date_str": h["date_str"],
+                    "is_today": h["is_today"],
+                    "in_window": h["in_window"],
+                    "ts_epoch": h["ts_epoch"],
+                }
+            else:
+                rec = grouped[g_key]
+                rec["prem_usd"] += h["prem_usd"]
+                rec["hits"] += 1
+                rec["days_set"].add(h["date_str"])
+                rec["is_golden"] = rec["is_golden"] or h["is_golden"]
+                rec["is_today"] = rec["is_today"] or h["is_today"]
+                rec["in_window"] = rec["in_window"] or h["in_window"]
+                if h["ts_epoch"] > rec["ts_epoch"]:
+                    rec["ts_epoch"] = h["ts_epoch"]
+                    rec["time_str"] = h["time_str"]
+                    rec["date_str"] = h["date_str"]
+
+        items = []
+        for rec in grouped.values():
+            rec["days_active"] = len(rec.pop("days_set"))
+            items.append(rec)
+
+        items.sort(key=lambda x: (x["in_window"], x["prem_usd"], x["ts_epoch"]), reverse=True)
         return items
 
     def _parse_darkpool_channel(messages):
@@ -1412,7 +1491,9 @@ def fetch_discord_whales(bot_token, channel_ids, limit=50):
                 m_fp = re.search(r"Float\s*Proportion:\s*([0-9.]+%)", details_txt, flags=re.IGNORECASE)
                 float_pct = m_fp.group(1) if m_fp else ""
 
-                is_today = (dt_pt.date() == today_pt) or (dt_et.date() == today_et)
+                msg_date_pt = dt_pt.date()
+                in_window = msg_date_pt >= cutoff_date_pt
+                is_today = msg_date_pt == today_pt
                 items.append({
                     "ticker": sym,
                     "price": price_val,
@@ -1422,19 +1503,25 @@ def fetch_discord_whales(bot_token, channel_ids, limit=50):
                     "filled": filled_str,
                     "float_pct": float_pct,
                     "time_str": dt_pt.strftime("%H:%M PT"),
-                    "date_str": str(dt_pt.date()),
+                    "date_str": str(msg_date_pt),
                     "is_today": is_today,
+                    "in_window": in_window,
                     "ts_epoch": ts_epoch,
                 })
 
-        items.sort(key=lambda x: (x["is_today"], x["ts_epoch"], x["amount_usd"]), reverse=True)
-        return items
+        in_win = [x for x in items if x["in_window"]]
+        use_items = in_win if in_win else items
+        if days_int > 1:
+            use_items.sort(key=lambda x: (x["in_window"], x["amount_usd"], x["ts_epoch"]), reverse=True)
+        else:
+            use_items.sort(key=lambda x: (x["in_window"], x["ts_epoch"], x["amount_usd"]), reverse=True)
+        return use_items
 
     for key, is_dp in (("golden", False), ("sweeps", False), ("dark_pool", True)):
         cid = str(channel_ids.get(key) or "").strip()
         if not cid:
             continue
-        msgs, err = _discord_fetch_messages(cid, bot_token, limit=limit)
+        msgs, err = _discord_fetch_messages(cid, bot_token, max_messages=max_msgs, cutoff_epoch=cutoff_epoch)
         if err:
             out["errors"][key] = err
             continue
