@@ -551,17 +551,18 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
                     k_iv = row['implied_volatility']
                     k_type = row['type']
                     
-                    if k_dte <= 0 or k_iv <= 0 or spot <= 0 or k_strike <= 0:
+                    if k_dte < 0 or spot <= 0 or k_strike <= 0:
                         gammas.append(0.0)
                         deltas.append(0.0)
                         continue
                         
-                    T = k_dte / 365.0
+                    k_iv_eff = k_iv if (0.03 < k_iv < 4.0) else 0.35
+                    T = max(float(k_dte), 0.25) / 365.0
                     r = 0.045
                     try:
-                        d1 = (math.log(spot / k_strike) + (r + 0.5 * k_iv ** 2) * T) / (k_iv * math.sqrt(T))
+                        d1 = (math.log(spot / k_strike) + (r + 0.5 * k_iv_eff ** 2) * T) / (k_iv_eff * math.sqrt(T))
                         pdf = math.exp(-0.5 * d1**2) / math.sqrt(2.0 * math.pi)
-                        gamma = pdf / (spot * k_iv * math.sqrt(T))
+                        gamma = pdf / (spot * k_iv_eff * math.sqrt(T))
                         
                         cdf = 0.5 * (1.0 + math.erf(d1 / math.sqrt(2.0)))
                         delta = cdf if k_type == 'C' else (cdf - 1.0)
@@ -579,27 +580,88 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
         
     if df_raw.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), spot
-        
+
+    # Normalizar tipo ('C'/'P') y asegurar columnas numéricas válidas
+    df_raw['type'] = df_raw['type'].astype(str).str.strip().str.upper().str[0]
+    for _num_c in ('strike', 'dte', 'open_interest', 'volume', 'gamma', 'delta'):
+        if _num_c not in df_raw.columns:
+            df_raw[_num_c] = 0.0
+        else:
+            df_raw[_num_c] = pd.to_numeric(df_raw[_num_c], errors='coerce').fillna(0.0).astype(float)
+    if 'implied_volatility' not in df_raw.columns:
+        df_raw['implied_volatility'] = 0.35
+    else:
+        df_raw['implied_volatility'] = pd.to_numeric(df_raw['implied_volatility'], errors='coerce').fillna(0.0).astype(float)
+
+    # Limpiar IVs inválidas (ej. 0.00001 de Yahoo) y reparar Gamma/Delta faltantes con Black-Scholes (incluyendo 0 DTE)
+    valid_ivs = df_raw[(df_raw['implied_volatility'] > 0.03) & (df_raw['implied_volatility'] < 4.0)]['implied_volatility']
+    fallback_iv = float(valid_ivs.median()) if not valid_ivs.empty else 0.35
+    df_raw['implied_volatility'] = df_raw['implied_volatility'].apply(
+        lambda v: v if (0.03 < v < 4.0) else fallback_iv
+    )
+
+    if spot > 0 and ((df_raw['gamma'].abs().sum() <= 0) or (df_raw['delta'].abs().sum() <= 0) or (df_raw['gamma'] <= 0).any()):
+        bs_gammas = []
+        bs_deltas = []
+        r_bs_fix = 0.045
+        sqrt_2pi_fix = math.sqrt(2.0 * math.pi)
+        for _, rr_g in df_raw.iterrows():
+            g_cur = float(rr_g['gamma'])
+            d_cur = float(rr_g['delta'])
+            k_cur = float(rr_g['strike'])
+            if g_cur > 0.0 and d_cur != 0.0:
+                bs_gammas.append(g_cur)
+                bs_deltas.append(d_cur)
+                continue
+            if k_cur <= 0.0:
+                bs_gammas.append(g_cur)
+                bs_deltas.append(d_cur)
+                continue
+            iv_cur = float(rr_g['implied_volatility'])
+            if not (0.03 < iv_cur < 4.0):
+                iv_cur = fallback_iv
+            T_cur = max(float(rr_g['dte']), 0.25) / 365.0
+            try:
+                sqrt_T_c = math.sqrt(T_cur)
+                d1_c = (math.log(spot / k_cur) + (r_bs_fix + 0.5 * iv_cur * iv_cur) * T_cur) / (iv_cur * sqrt_T_c)
+                pdf_c = math.exp(-0.5 * d1_c * d1_c) / sqrt_2pi_fix
+                g_calc = pdf_c / (spot * iv_cur * sqrt_T_c)
+                cdf_c = 0.5 * (1.0 + math.erf(d1_c / math.sqrt(2.0)))
+                d_calc = cdf_c if rr_g['type'] == 'C' else (cdf_c - 1.0)
+                bs_gammas.append(g_cur if g_cur > 0.0 else g_calc)
+                bs_deltas.append(d_cur if d_cur != 0.0 else d_calc)
+            except Exception:
+                bs_gammas.append(g_cur)
+                bs_deltas.append(d_cur)
+        df_raw['gamma'] = bs_gammas
+        df_raw['delta'] = bs_deltas
+
+    # Si todo el OI del vencimiento vino en 0 (típico en 0DTE o fallos de OI en Yahoo), usar Volume como respaldo para no mostrar $0 plano
+    use_vol_weight = (df_raw['open_interest'].sum() <= 0.0) and (df_raw['volume'].sum() > 0.0)
+    eff_oi = df_raw['volume'] if use_vol_weight else df_raw['open_interest']
+
     # Calcular exposiciones locales según el modo
+    is_c_mask = df_raw['type'] == 'C'
+    is_p_mask = df_raw['type'] == 'P'
     if mode == "Acciones":
         # MODO ACCIONES: Exposición en acciones (sin el 100x y multiplicado por spot lineal)
-        df_raw['call_gex'] = df_raw.apply(lambda r: r['open_interest'] * r['gamma'] * spot if r['type'] == 'C' else 0.0, axis=1)
-        df_raw['put_gex'] = df_raw.apply(lambda r: -r['open_interest'] * r['gamma'] * spot if r['type'] == 'P' else 0.0, axis=1)
+        df_raw['call_gex'] = np.where(is_c_mask, eff_oi * df_raw['gamma'] * spot, 0.0)
+        df_raw['put_gex'] = np.where(is_p_mask, -eff_oi * df_raw['gamma'] * spot, 0.0)
         df_raw['net_gex'] = df_raw['call_gex'] + df_raw['put_gex']
-        df_raw['vol_gex'] = df_raw.apply(lambda r: (r['volume'] * r['gamma'] * spot) if r['type'] == 'C' else (-r['volume'] * r['gamma'] * spot), axis=1)
+        df_raw['vol_gex'] = np.where(is_c_mask, df_raw['volume'] * df_raw['gamma'] * spot, -df_raw['volume'] * df_raw['gamma'] * spot)
         
-        df_raw['call_dex'] = df_raw.apply(lambda r: r['open_interest'] * r['delta'] * spot if r['type'] == 'C' else 0.0, axis=1)
-        df_raw['put_dex'] = df_raw.apply(lambda r: r['open_interest'] * r['delta'] * spot if r['type'] == 'P' else 0.0, axis=1)
+        df_raw['call_dex'] = np.where(is_c_mask, eff_oi * df_raw['delta'] * spot, 0.0)
+        df_raw['put_dex'] = np.where(is_p_mask, eff_oi * df_raw['delta'] * spot, 0.0)
         df_raw['net_dex'] = df_raw['call_dex'] + df_raw['put_dex']
     else:
         # MODO USD: Fórmula oficial en USD (con spot*spot para GEX y delta*spot*100 para DEX)
-        df_raw['call_gex'] = df_raw.apply(lambda r: r['open_interest'] * r['gamma'] * spot * spot if r['type'] == 'C' else 0.0, axis=1)
-        df_raw['put_gex'] = df_raw.apply(lambda r: -r['open_interest'] * r['gamma'] * spot * spot if r['type'] == 'P' else 0.0, axis=1)
+        df_raw['call_gex'] = np.where(is_c_mask, eff_oi * df_raw['gamma'] * spot * spot, 0.0)
+        df_raw['put_gex'] = np.where(is_p_mask, -eff_oi * df_raw['gamma'] * spot * spot, 0.0)
         df_raw['net_gex'] = df_raw['call_gex'] + df_raw['put_gex']
-        df_raw['vol_gex'] = df_raw.apply(lambda r: (r['volume'] * r['gamma'] * spot * spot) if r['type'] == 'C' else (-r['volume'] * r['gamma'] * spot * spot), axis=1)
+        df_raw['vol_gex'] = np.where(is_c_mask, df_raw['volume'] * df_raw['gamma'] * spot * spot, -df_raw['volume'] * df_raw['gamma'] * spot * spot)
         
-        df_raw['call_dex'] = df_raw.apply(lambda r: r['open_interest'] * r['delta'] * spot * 100.0 if r['type'] == 'C' else 0.0, axis=1)
-        df_raw['put_dex'] = df_raw.apply(lambda r: r['open_interest'] * r['delta'] * spot * 100.0 if r['type'] == 'P' else 0.0, axis=1)
+        df_raw['call_dex'] = np.where(is_c_mask, eff_oi * df_raw['delta'] * spot * 100.0, 0.0)
+        df_raw['put_dex'] = np.where(is_p_mask, eff_oi * df_raw['delta'] * spot * 100.0, 0.0)
         df_raw['net_dex'] = df_raw['call_dex'] + df_raw['put_dex']
 
     # Campos de soporte comunes
@@ -660,7 +722,7 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
         iv_val = float(r.get('implied_volatility', 0.20) or 0.20)
         if iv_val <= 0:
             iv_val = 0.20
-        oi_val = float(r.get('open_interest', 0.0) or 0.0)
+        oi_val = float(r.get('volume', 0.0) or 0.0) if use_vol_weight else float(r.get('open_interest', 0.0) or 0.0)
         opt_t = r.get('type', 'C')
 
         if spot <= 0 or k <= 0 or oi_val <= 0:
