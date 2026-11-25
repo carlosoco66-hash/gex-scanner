@@ -224,17 +224,61 @@ def format_millions(val, mode="USD"):
         prefix = "-" if is_neg else ""
         return f"{prefix}{s}$"
 
-# Helper para mapear ticker a TradingView
+# Helper para mapear ticker a TradingView (con detección automática de exchange para stocks y ETFs)
+@st.cache_data(ttl=86400)
 def get_tv_symbol(ticker):
     ticker = ticker.upper().strip()
-    if ticker in ["SPY", "IWM", "DIA", "GLD", "SLV", "UNG", "USO"]:
-        return f"AMEX:{ticker}"
-    elif ticker in ["QQQ", "TSLA", "AAPL", "MSFT", "NVDA", "AMD", "META", "AMZN", "NFLX", "GOOG", "GOOGL"]:
-        return f"NASDAQ:{ticker}"
-    elif ticker in ["BTC", "ETH", "SOL", "ADA", "XRP", "DOGE"]:
+    if not ticker:
+        return "AMEX:SPY"
+    if ":" in ticker:
+        return ticker
+    if ticker in {"BTC", "ETH", "SOL", "ADA", "XRP", "DOGE"}:
         return f"COINBASE:{ticker}USD"
-    else:
-        return f"NYSE:{ticker}"
+    if ticker in {
+        "SPY", "IWM", "DIA", "GLD", "SLV", "UNG", "USO", "IYW", "EWT", "EEM", "EFA", "EWZ",
+        "FXI", "KWEB", "XLF", "XLE", "XLK", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE",
+        "XLC", "XBI", "XOP", "KRE", "ARKK", "SOXL", "SOXS", "UVXY", "VXX", "HYG", "LQD",
+        "BITO", "GDX", "GDXJ", "VTI", "VOO", "SCHD", "RSP",
+    }:
+        return f"AMEX:{ticker}"
+    if ticker in {
+        "QQQ", "TQQQ", "SQQQ", "SMH", "SOXX", "TLT", "IEF", "SHY", "IBIT", "ETHA",
+        "TSLA", "AAPL", "MSFT", "NVDA", "AMD", "META", "AMZN", "NFLX", "GOOG", "GOOGL",
+        "MU", "AVGO", "MRVL", "MRNA", "WDAY", "CRWV", "PLTR", "COIN", "MSTR", "INTC",
+        "QCOM", "ARM", "COST", "PYPL", "PANW", "CRWD", "HOOD", "SOFI", "APP", "SMCI",
+        "ASML", "LRCX", "KLAC", "AMAT", "ADBE", "SHOP", "MARA", "RIOT", "CLSK", "IREN",
+        "CAR", "EOLS", "PEP", "SBUX", "CSCO", "TXN", "ISRG", "BKNG", "MELI", "PDD", "JD",
+        "RIVN", "DKNG", "AFRM", "DDOG", "ZS", "MDB", "FTNT", "ENPH", "FSLR", "TTD",
+    }:
+        return f"NASDAQ:{ticker}"
+
+    # Detección automática del exchange real vía yfinance para cualquier otro stock o ETF
+    try:
+        import yfinance as yf
+        t_yf = yf.Ticker(ticker)
+        exch = ""
+        try:
+            fi = t_yf.fast_info
+            exch = str(fi.get("exchange", "") or "").upper()
+        except Exception:
+            pass
+        if not exch:
+            try:
+                exch = str((t_yf.info or {}).get("exchange", "") or "").upper()
+            except Exception:
+                pass
+
+        if exch in {"NMS", "NGM", "NCM", "NAS", "NASDAQ"}:
+            return f"NASDAQ:{ticker}"
+        if exch in {"NYQ", "NYS", "NYSE"}:
+            return f"NYSE:{ticker}"
+        if exch in {"PCX", "ASE", "ARC", "AMEX", "ARCA"}:
+            return f"AMEX:{ticker}"
+    except Exception:
+        pass
+
+    # Respaldo seguro: símbolo limpio sin prefijo forzado para que TradingView lo resuelva solo
+    return ticker
 
 # --- HELPERS PARA GRÁFICOS PLOTLY DE BARRAS ---
 def plot_gex_plotly(df_gex, spot, mode="USD", pct=15):
@@ -607,13 +651,15 @@ if _disc_configured:
                     break
             if uniq_syms:
                 st.caption("🔍 **Analizar en 1 clic** (carga el ticker abajo con su GEX, Gamma Flip y Scanner):")
-                btn_cols = st.columns(len(uniq_syms))
-                for i_s, sym_pick in enumerate(uniq_syms):
-                    with btn_cols[i_s]:
-                        if st.button(f"🔍 {sym_pick}", key=f"dw_go_{ch_key}_{sym_pick}", use_container_width=True):
-                            st.session_state["main_ticker_input"] = sym_pick
-                            st.session_state.force_refresh = True
-                            st.rerun()
+                for row_start in range(0, len(uniq_syms), 4):
+                    chunk = uniq_syms[row_start:row_start + 4]
+                    btn_cols = st.columns(4)
+                    for i_s, sym_pick in enumerate(chunk):
+                        with btn_cols[i_s]:
+                            if st.button(f"🔍 {sym_pick}", key=f"dw_go_{ch_key}_{sym_pick}", use_container_width=True):
+                                st.session_state["main_ticker_input"] = sym_pick
+                                st.session_state.force_refresh = True
+                                st.rerun()
 
         def _render_discord_dp_tab(items):
             if "dark_pool" in _dw_errors:
@@ -686,13 +732,15 @@ if _disc_configured:
                     break
             if uniq_syms:
                 st.caption("🔍 **Analizar en 1 clic:**")
-                btn_cols = st.columns(len(uniq_syms))
-                for i_s, sym_pick in enumerate(uniq_syms):
-                    with btn_cols[i_s]:
-                        if st.button(f"🔍 {sym_pick}", key=f"dw_go_dp_{sym_pick}", use_container_width=True):
-                            st.session_state["main_ticker_input"] = sym_pick
-                            st.session_state.force_refresh = True
-                            st.rerun()
+                for row_start in range(0, len(uniq_syms), 4):
+                    chunk = uniq_syms[row_start:row_start + 4]
+                    btn_cols = st.columns(4)
+                    for i_s, sym_pick in enumerate(chunk):
+                        with btn_cols[i_s]:
+                            if st.button(f"🔍 {sym_pick}", key=f"dw_go_dp_{sym_pick}", use_container_width=True):
+                                st.session_state["main_ticker_input"] = sym_pick
+                                st.session_state.force_refresh = True
+                                st.rerun()
 
         dw_t1, dw_t2, dw_t3 = st.tabs(["🥇 #golden-sweeps", "🌊 #options-sweeps", "🕶️ #dark-pool"])
         with dw_t1:
