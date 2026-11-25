@@ -2517,16 +2517,48 @@ if st.session_state.expirations:
             if not df_raw.empty:
                 st.markdown("<h2 class='custom-header'>Scanner de Contratos (Top OI &amp; Volume)</h2>", unsafe_allow_html=True)
 
+                # Barrita compacta de 3 controles (Mostrar Top N · Fuente de fechas · Buscar strike)
+                c_sc1, c_sc2, c_sc3 = st.columns([1.3, 2.2, 1.8])
+                with c_sc1:
+                    sc_top_lbl = st.selectbox(
+                        "Mostrar",
+                        ["Top 10", "Top 15", "Top 20", "Top 30"],
+                        index=0,
+                        key="sc_top_n_sel",
+                        label_visibility="collapsed",
+                    )
+                with c_sc2:
+                    sc_src_mode = st.selectbox(
+                        "Fechas",
+                        ["Cadena completa", "Solo fechas seleccionadas"],
+                        index=0,
+                        key="sc_src_mode_sel",
+                        label_visibility="collapsed",
+                    )
+                with c_sc3:
+                    sc_strike_q = st.text_input(
+                        "Buscar strike",
+                        value="",
+                        placeholder="🔍 Strike (ej. 20)",
+                        key="sc_strike_search",
+                        label_visibility="collapsed",
+                    ).strip().replace("$", "")
+
+                sc_top_n = {"Top 10": 10, "Top 15": 15, "Top 20": 20, "Top 30": 30}.get(sc_top_lbl, 10)
+
                 full_sc_records = df_raw.attrs.get("full_chain_scanner") if hasattr(df_raw, "attrs") else None
-                using_full_chain = isinstance(full_sc_records, list) and len(full_sc_records) > 0
+                has_full_chain = isinstance(full_sc_records, list) and len(full_sc_records) > 0
+                using_full_chain = (sc_src_mode == "Cadena completa") and has_full_chain
                 df_contracts = pd.DataFrame(full_sc_records) if using_full_chain else df_raw.copy()
 
-                df_contracts["contract_type"] = df_contracts["type"].apply(lambda t: "call" if t == "C" else "put")
+                df_contracts["contract_type"] = df_contracts["type"].apply(lambda t: "call" if str(t).upper().startswith("C") else "put")
                 df_contracts["strike"] = pd.to_numeric(df_contracts["strike"], errors="coerce").fillna(0.0)
                 df_contracts["dte"] = pd.to_numeric(df_contracts["dte"], errors="coerce").fillna(0).astype(int)
                 df_contracts["open_interest"] = pd.to_numeric(df_contracts["open_interest"], errors="coerce").fillna(0).astype(int)
                 df_contracts["volume"] = pd.to_numeric(df_contracts["volume"], errors="coerce").fillna(0).astype(int)
                 df_contracts["delta"] = pd.to_numeric(df_contracts["delta"], errors="coerce").fillna(0.0)
+                if "expiry" not in df_contracts.columns:
+                    df_contracts["expiry"] = ""
                 if "net_gex" not in df_contracts.columns:
                     df_contracts["net_gex"] = 0.0
                 else:
@@ -2536,15 +2568,29 @@ if st.session_state.expirations:
                 else:
                     df_contracts["vol_gex"] = pd.to_numeric(df_contracts["vol_gex"], errors="coerce").fillna(0.0)
 
+                # Filtro opcional por strike específico (ej. "20" muestra todos los contratos del strike $20)
+                sc_strike_val = None
+                if sc_strike_q:
+                    try:
+                        sc_strike_val = float(sc_strike_q)
+                        df_contracts = df_contracts[(df_contracts["strike"] - sc_strike_val).abs() < 0.01].copy()
+                    except Exception:
+                        sc_strike_val = None
+
                 spot_sc = float(res["Spot Price"])
-                df_contracts["ITM_State"] = df_contracts.apply(
-                    lambda r: "ITM" if (r["contract_type"] == "call" and r["strike"] < spot_sc)
-                    or (r["contract_type"] == "put" and r["strike"] > spot_sc)
-                    else "OTM",
-                    axis=1,
-                )
-                df_contracts["oi_vol_sum"] = df_contracts["open_interest"] + df_contracts["volume"]
-                df_contracts["intra_score"] = df_contracts["volume"] * 2 + df_contracts["open_interest"]
+                if not df_contracts.empty:
+                    df_contracts["ITM_State"] = df_contracts.apply(
+                        lambda r: "ITM" if (r["contract_type"] == "call" and r["strike"] < spot_sc)
+                        or (r["contract_type"] == "put" and r["strike"] > spot_sc)
+                        else "OTM",
+                        axis=1,
+                    )
+                    df_contracts["oi_vol_sum"] = df_contracts["open_interest"] + df_contracts["volume"]
+                    df_contracts["intra_score"] = df_contracts["volume"] * 2 + df_contracts["open_interest"]
+                else:
+                    df_contracts["ITM_State"] = []
+                    df_contracts["oi_vol_sum"] = []
+                    df_contracts["intra_score"] = []
 
                 def _sc_vol_cell(val, rank, is_call):
                     txt = f"{int(val):,}"
@@ -2639,7 +2685,12 @@ if st.session_state.expirations:
                             'background:rgba(239,68,68,0.16);color:#f87171;border:1px solid rgba(239,68,68,0.45);">PUT</span>'
                         )
                         strike_str = f"${float(rr['strike']):g}"
-                        dte_str = f"{int(rr['dte'])}d"
+                        exp_full = str(rr.get("expiry", "") or "")
+                        exp_s = exp_full[:7]
+                        if sc_strike_val is not None and exp_s:
+                            dte_str = f"{int(rr['dte'])}d <span style='color:#6e7681;font-size:10.5px;'>({exp_s})</span>"
+                        else:
+                            dte_str = f"<span title='Vence: {exp_full}'>{int(rr['dte'])}d</span>"
                         oi_v = int(rr["open_interest"])
                         vol_v = int(rr["volume"])
                         delta_v = float(rr["delta"])
@@ -2740,6 +2791,12 @@ if st.session_state.expirations:
                     st.caption(footnote_txt)
 
                 source_tag = "Cadena completa" if using_full_chain else "Fechas seleccionadas"
+                strike_tag = ""
+                if sc_strike_val is not None:
+                    tot_oi_s = int(df_contracts["open_interest"].sum()) if not df_contracts.empty else 0
+                    tot_vol_s = int(df_contracts["volume"].sum()) if not df_contracts.empty else 0
+                    strike_tag = f" · <span style='color:#fbbf24;'>Strike ${sc_strike_val:g} (Total OI: {tot_oi_s:,} · Vol: {tot_vol_s:,})</span>"
+
                 tab_sc_all, tab_sc_intra, tab_sc_swing, tab_sc_leaps = st.tabs([
                     "🌐 Todos (Completa)",
                     "⚡ Intradía (0–7d)",
@@ -2748,36 +2805,37 @@ if st.session_state.expirations:
                 ])
 
                 with tab_sc_all:
+                    df_sc_all = df_contracts.nlargest(sc_top_n, "oi_vol_sum")
                     _render_contract_scanner_tab(
-                        df_contracts.nlargest(10, "oi_vol_sum"),
-                        "<b>🌐 Vista Completa (Top 10 OI + Volume)</b> · Todos los vencimientos combinados",
-                        f"Top 10 · {source_tag}",
+                        df_sc_all,
+                        f"<b>🌐 Vista Completa (Top {sc_top_n} OI + Volume)</b> · Todos los vencimientos combinados{strike_tag}",
+                        f"Top {len(df_sc_all)} · {source_tag}",
                         "💡 **~** en GEX = estimado con Volume de hoy porque `OI = 0` (mañana pasa a GEX oficial). Cajitas llenas = Top 3 Volume (verde Calls / rojo Puts) · Bordes = Top 3 OI (cian Calls / ámbar Puts) · **🔀 Spread** = mismo tipo/DTE y volumen espejo.",
                     )
 
                 with tab_sc_intra:
-                    df_sc_intra = df_contracts[df_contracts["dte"] <= 7].nlargest(10, "intra_score")
+                    df_sc_intra = df_contracts[df_contracts["dte"] <= 7].nlargest(sc_top_n, "intra_score")
                     _render_contract_scanner_tab(
                         df_sc_intra,
-                        "<b>⚡ Intradía / Scalping (0–7 DTE)</b> · Prioriza Volume activo + GEX de hoy",
+                        f"<b>⚡ Intradía / Scalping (0–7 DTE)</b> · Prioriza Volume activo + GEX de hoy{strike_tag}",
                         f"Top {len(df_sc_intra)} · 0–7 DTE · {source_tag}",
                         "💡 En **0–7 DTE** mandan **Volume**, **Vol/OI ≥ 1.0x** y **GEX**: muestran dónde los dealers están ajustando cobertura hoy.",
                     )
 
                 with tab_sc_swing:
-                    df_sc_swing = df_contracts[(df_contracts["dte"] >= 8) & (df_contracts["dte"] <= 60)].nlargest(10, "oi_vol_sum")
+                    df_sc_swing = df_contracts[(df_contracts["dte"] >= 8) & (df_contracts["dte"] <= 60)].nlargest(sc_top_n, "oi_vol_sum")
                     _render_contract_scanner_tab(
                         df_sc_swing,
-                        "<b>📈 Swing (8–60 DTE)</b> · Posicionamiento semanal/mensual, flujo nuevo y Spreads",
+                        f"<b>📈 Swing (8–60 DTE)</b> · Posicionamiento semanal/mensual, flujo nuevo y Spreads{strike_tag}",
                         f"Top {len(df_sc_swing)} · 8–60 DTE · {source_tag}",
                         "💡 Ideal para detectar apuestas institucionales de 2–8 semanas y **🔀 Spreads** sin ruido de 0DTE ni LEAPS.",
                     )
 
                 with tab_sc_leaps:
-                    df_sc_leaps = df_contracts[df_contracts["dte"] > 60].nlargest(10, "oi_vol_sum")
+                    df_sc_leaps = df_contracts[df_contracts["dte"] > 60].nlargest(sc_top_n, "oi_vol_sum")
                     _render_contract_scanner_tab(
                         df_sc_leaps,
-                        "<b>🏛️ Largo Plazo / LEAPS (&gt;60 DTE)</b> · Muros estructurales y coberturas de fondos",
+                        f"<b>🏛️ Largo Plazo / LEAPS (&gt;60 DTE)</b> · Muros estructurales y coberturas de fondos{strike_tag}",
                         f"Top {len(df_sc_leaps)} · >60 DTE · {source_tag}",
                         "💡 Úsalos como **mapa macro** de pisos y techos institucionales a varios meses (aquí manda **OI + Delta** más que el GEX diario).",
                     )

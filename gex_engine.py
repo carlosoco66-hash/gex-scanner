@@ -320,11 +320,12 @@ def _build_full_chain_scanner_records(df_full, spot, mode="USD"):
         df['_score_all'] = df['open_interest'] + df['volume']
         df['_score_intra'] = df['volume'] * 2.0 + df['open_interest']
 
+        df_active = df[(df['open_interest'] > 0) | (df['volume'] > 0)]
         buckets = [
-            df.nlargest(25, '_score_all'),
-            df[df['dte'] <= 7].nlargest(25, '_score_intra'),
-            df[(df['dte'] >= 8) & (df['dte'] <= 60)].nlargest(25, '_score_all'),
-            df[df['dte'] > 60].nlargest(25, '_score_all'),
+            df_active.nlargest(1500, '_score_all') if not df_active.empty else df.nlargest(40, '_score_all'),
+            df[df['dte'] <= 7].nlargest(40, '_score_intra'),
+            df[(df['dte'] >= 8) & (df['dte'] <= 60)].nlargest(40, '_score_all'),
+            df[df['dte'] > 60].nlargest(40, '_score_all'),
         ]
         non_empty = [b for b in buckets if not b.empty]
         if not non_empty:
