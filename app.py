@@ -69,8 +69,21 @@ get_macro_climate = getattr(
     "get_macro_climate",
     lambda api_key: {"vix": 0.0, "vix_chg": 0.0, "vvix": 0.0, "vvix_chg": 0.0, "move": 0.0, "move_chg": 0.0, "indices_gex": {}},
 )
+fetch_discord_whales = getattr(
+    gex_engine,
+    "fetch_discord_whales",
+    lambda bot_token, channel_ids, limit=50: {"golden": [], "sweeps": [], "dark_pool": [], "errors": {}},
+)
 
 # Funciones con caché para optimizar consultas de la API (60s para datos en vivo)
+@st.cache_data(ttl=60)
+def cached_discord_whales(bot_token, golden_id, sweeps_id, darkpool_id, limit=50):
+    return fetch_discord_whales(
+        bot_token,
+        {"golden": golden_id, "sweeps": sweeps_id, "dark_pool": darkpool_id},
+        limit=limit,
+    )
+
 @st.cache_data(ttl=300)
 def cached_macro_climate(api_key):
     return get_macro_climate(api_key)
@@ -436,18 +449,276 @@ with st.sidebar.expander("🎨 Personalizar Colores", expanded=False):
     st.color_picker("Color de Spot", "#ffcc00")
 
 # --- UI PRINCIPAL ---
-st.markdown("<h1 style='font-size: 36px; margin-bottom: 20px;'>Gamma Scanner Options</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='font-size: 36px; margin-bottom: 12px;'>Gamma Scanner Options</h1>", unsafe_allow_html=True)
 
 # Inicializar estados
 if 'expirations' not in st.session_state:
     st.session_state.expirations = []
 if 'last_ticker' not in st.session_state:
     st.session_state.last_ticker = ""
+if "main_ticker_input" not in st.session_state:
+    st.session_state["main_ticker_input"] = "SPY"
+
+# Panel colapsable superior: 🐋 Ballenas Hoy (Tu Discord en Vivo)
+try:
+    _disc_token = str(st.secrets.get("DISCORD_BOT_TOKEN", "") or "").strip()
+    _disc_golden_id = str(st.secrets.get("DISCORD_GOLDEN_CHANNEL_ID", "") or "").strip()
+    _disc_sweeps_id = str(st.secrets.get("DISCORD_SWEEPS_CHANNEL_ID", "") or "").strip()
+    _disc_dp_id = str(st.secrets.get("DISCORD_DARKPOOL_CHANNEL_ID", "") or "").strip()
+except Exception:
+    _disc_token = ""
+    _disc_golden_id = ""
+    _disc_sweeps_id = ""
+    _disc_dp_id = ""
+
+_disc_configured = bool(_disc_token and (_disc_golden_id or _disc_sweeps_id or _disc_dp_id))
+
+if _disc_configured:
+    _dw_data = cached_discord_whales(_disc_token, _disc_golden_id, _disc_sweeps_id, _disc_dp_id, limit=50)
+    _dw_golden = _dw_data.get("golden", [])
+    _dw_sweeps = _dw_data.get("sweeps", [])
+    _dw_dp = _dw_data.get("dark_pool", [])
+    _dw_errors = _dw_data.get("errors", {})
+
+    _g_today = [x for x in _dw_golden if x.get("is_today")]
+    _top_ref = (_g_today[0] if _g_today else (_dw_golden[0] if _dw_golden else (_dw_sweeps[0] if _dw_sweeps else None)))
+    _n_alerts = len(_g_today) if _g_today else (len(_dw_golden) + len(_dw_sweeps))
+    if _top_ref:
+        _top_p = format_millions(_top_ref.get("prem_usd", 0.0), "USD")
+        _top_hits = f" ({_top_ref['hits']}x)" if _top_ref.get("hits", 1) > 1 else ""
+        _exp_label = f"🐋 Ballenas Hoy (Tu Discord en Vivo) · ● Conectado · {_n_alerts} alertas · Top: {_top_ref['ticker']} {_top_p}{_top_hits}"
+    else:
+        _exp_label = "🐋 Ballenas Hoy (Tu Discord en Vivo) · ● Conectado"
+
+    with st.expander(_exp_label, expanded=False):
+        c_dw1, c_dw2, c_dw3, c_dw4 = st.columns([1.4, 1.8, 1.8, 1.4])
+        with c_dw1:
+            _dw_only_today = st.checkbox("Solo hoy", value=True, key="dw_only_today")
+        with c_dw2:
+            _dw_side = st.selectbox("Tipo", ["Todos", "Solo Calls", "Solo Puts"], key="dw_side_flt", label_visibility="collapsed")
+        with c_dw3:
+            _dw_min_prem_lbl = st.selectbox("Prima mínima", ["Prima: Todas", "≥ $250K", "≥ $500K", "≥ $1M"], key="dw_prem_flt", label_visibility="collapsed")
+        with c_dw4:
+            if st.button("🔄 Refrescar Discord", use_container_width=True, key="dw_refresh_btn"):
+                cached_discord_whales.clear()
+                st.rerun()
+
+        _dw_min_prem = {"Prima: Todas": 0.0, "≥ $250K": 250_000.0, "≥ $500K": 500_000.0, "≥ $1M": 1_000_000.0}.get(_dw_min_prem_lbl, 0.0)
+
+        def _render_discord_sweeps_tab(items, ch_key, ch_title):
+            if ch_key in _dw_errors:
+                st.warning(f"No se pudo leer {ch_title}: {_dw_errors[ch_key]}")
+                return
+            if not items:
+                st.info(f"Sin alertas recientes en {ch_title}.")
+                return
+
+            filtered = [x for x in items if (not _dw_only_today or x.get("is_today"))]
+            showing_recent_fallback = False
+            if not filtered and _dw_only_today:
+                filtered = items[:]
+                showing_recent_fallback = True
+
+            if _dw_side == "Solo Calls":
+                filtered = [x for x in filtered if x.get("type") == "CALL"]
+            elif _dw_side == "Solo Puts":
+                filtered = [x for x in filtered if x.get("type") == "PUT"]
+            if _dw_min_prem > 0:
+                filtered = [x for x in filtered if float(x.get("prem_usd", 0.0)) >= _dw_min_prem]
+
+            filtered = filtered[:20]
+            if not filtered:
+                st.info("Ninguna alerta cumple el filtro actual (prueba bajar la prima mínima o desmarcar 'Solo hoy').")
+                return
+
+            tot_prem = sum(float(x.get("prem_usd", 0.0)) for x in filtered)
+            note_txt = " · mostrando últimas recientes (sin alertas hoy todavía)" if showing_recent_fallback else ""
+            st.markdown(
+                '<div style="background:#161b22;border:1px solid #30363d;border-radius:7px;padding:6px 10px;margin-bottom:6px;'
+                'display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;font-size:12px;">'
+                f'<span style="color:#e6edf3;"><b>{ch_title}</b> · {len(filtered)} señales agrupadas{note_txt}</span>'
+                f'<span style="color:#fbbf24;font-weight:700;">Prima acumulada: {format_millions(tot_prem, "USD")}</span>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+            rows_h = ""
+            for r in filtered:
+                is_c = r["type"] == "CALL"
+                t_pill = (
+                    '<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:800;font-size:11px;'
+                    'background:rgba(34,197,94,0.16);color:#4ade80;border:1px solid rgba(34,197,94,0.45);">CALL</span>'
+                    if is_c else
+                    '<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:800;font-size:11px;'
+                    'background:rgba(239,68,68,0.16);color:#f87171;border:1px solid rgba(239,68,68,0.45);">PUT</span>'
+                )
+                dte_part = f" <span style='color:#6e7681;'>({r['dte']}d)</span>" if int(r.get("dte", -1)) >= 0 else ""
+                p_usd = float(r.get("prem_usd", 0.0))
+                p_clr = "#fde047" if p_usd >= 1_000_000 else ("#e6edf3" if p_usd >= 500_000 else "#c9d1d9")
+                p_wt = "800" if p_usd >= 1_000_000 else "600"
+                hits_n = int(r.get("hits", 1))
+                hits_h = (
+                    f'<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:700;font-size:11px;'
+                    f'background:rgba(168,85,247,0.18);color:#c084fc;border:1px solid rgba(168,85,247,0.45);">{hits_n}x 🔥</span>'
+                    if hits_n > 1 else '<span style="color:#8b949e;">1x</span>'
+                )
+                tag_h = (
+                    '<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-weight:700;font-size:11px;'
+                    'background:rgba(245,158,11,0.20);color:#fbbf24;border:1px solid rgba(245,158,11,0.55);">🥇 Golden</span>'
+                    if r.get("is_golden") else '<span style="color:#8b949e;">⚡ Sweep</span>'
+                )
+                date_badge = "" if r.get("is_today") else f" <span style='color:#6e7681;font-size:10.5px;'>{r.get('date_str','')[5:]}</span>"
+                rows_h += (
+                    '<tr style="border-bottom:1px solid #21262d;">'
+                    f'<td style="padding:5px 7px;text-align:left;font-weight:800;color:#ffffff;white-space:nowrap;">{r["ticker"]}</td>'
+                    f'<td style="padding:5px 6px;text-align:left;white-space:nowrap;">{t_pill}</td>'
+                    f'<td style="padding:5px 6px;text-align:left;font-weight:700;color:#e6edf3;white-space:nowrap;">${float(r["strike"]):g}</td>'
+                    f'<td style="padding:5px 6px;text-align:left;color:#c9d1d9;white-space:nowrap;">{r["exp"]}{dte_part}</td>'
+                    f'<td style="padding:5px 7px;text-align:right;font-weight:{p_wt};color:{p_clr};white-space:nowrap;">{format_millions(p_usd, "USD")}</td>'
+                    f'<td style="padding:5px 6px;text-align:center;white-space:nowrap;">{hits_h}</td>'
+                    f'<td style="padding:5px 6px;text-align:center;white-space:nowrap;">{tag_h}</td>'
+                    f'<td style="padding:5px 7px;text-align:right;color:#8b949e;white-space:nowrap;">{r["time_str"]}{date_badge}</td>'
+                    '</tr>'
+                )
+
+            st.markdown(
+                '<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;overflow:hidden;margin-bottom:8px;">'
+                '<table style="width:100%;border-collapse:collapse;font-size:12px;font-family:\'Inter\',sans-serif;font-variant-numeric:tabular-nums;">'
+                '<thead><tr style="background:#161b22;border-bottom:1px solid #30363d;color:#8b949e;">'
+                '<th style="padding:6px 7px;text-align:left;">Ticker</th>'
+                '<th style="padding:6px 6px;text-align:left;">Tipo</th>'
+                '<th style="padding:6px 6px;text-align:left;">Strike</th>'
+                '<th style="padding:6px 6px;text-align:left;">Vence</th>'
+                '<th style="padding:6px 7px;text-align:right;">Prima Total</th>'
+                '<th style="padding:6px 6px;text-align:center;">Golpes</th>'
+                '<th style="padding:6px 6px;text-align:center;">Señal</th>'
+                '<th style="padding:6px 7px;text-align:right;">Hora</th>'
+                '</tr></thead>'
+                f'<tbody>{rows_h}</tbody></table></div>',
+                unsafe_allow_html=True,
+            )
+
+            # Botones rápidos 1-clic para cargar cualquiera de los tickers detectados arriba
+            uniq_syms = []
+            for r in filtered:
+                if r["ticker"] not in uniq_syms:
+                    uniq_syms.append(r["ticker"])
+                if len(uniq_syms) >= 8:
+                    break
+            if uniq_syms:
+                st.caption("🔍 **Analizar en 1 clic** (carga el ticker abajo con su GEX, Gamma Flip y Scanner):")
+                btn_cols = st.columns(len(uniq_syms))
+                for i_s, sym_pick in enumerate(uniq_syms):
+                    with btn_cols[i_s]:
+                        if st.button(f"🔍 {sym_pick}", key=f"dw_go_{ch_key}_{sym_pick}", use_container_width=True):
+                            st.session_state["main_ticker_input"] = sym_pick
+                            st.session_state.force_refresh = True
+                            st.rerun()
+
+        def _render_discord_dp_tab(items):
+            if "dark_pool" in _dw_errors:
+                st.warning(f"No se pudo leer #dark-pool: {_dw_errors['dark_pool']}")
+                return
+            if not items:
+                st.info("Sin bloques recientes en #dark-pool.")
+                return
+
+            filtered = [x for x in items if (not _dw_only_today or x.get("is_today"))]
+            showing_recent_fallback = False
+            if not filtered and _dw_only_today:
+                filtered = items[:]
+                showing_recent_fallback = True
+            if _dw_min_prem > 0:
+                filtered = [x for x in filtered if float(x.get("amount_usd", 0.0)) >= _dw_min_prem]
+
+            filtered = filtered[:20]
+            if not filtered:
+                st.info("Ningún bloque Dark Pool cumple el filtro actual.")
+                return
+
+            note_txt = " · mostrando últimos recientes" if showing_recent_fallback else ""
+            st.markdown(
+                '<div style="background:#161b22;border:1px solid #30363d;border-radius:7px;padding:6px 10px;margin-bottom:6px;'
+                'display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;font-size:12px;">'
+                f'<span style="color:#e6edf3;"><b>🕶️ #dark-pool</b> · {len(filtered)} bloques institucionales{note_txt}</span>'
+                '<span style="color:#38bdf8;font-weight:700;">Blocktrades en acciones</span>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+            rows_h = ""
+            for r in filtered:
+                amt_v = float(r.get("amount_usd", 0.0))
+                amt_disp = format_millions(amt_v, "USD") if amt_v > 0 else r.get("amount_str", "-")
+                fp_disp = r.get("float_pct") or "-"
+                date_badge = "" if r.get("is_today") else f" <span style='color:#6e7681;font-size:10.5px;'>{r.get('date_str','')[5:]}</span>"
+                rows_h += (
+                    '<tr style="border-bottom:1px solid #21262d;">'
+                    f'<td style="padding:5px 7px;text-align:left;font-weight:800;color:#ffffff;white-space:nowrap;">{r["ticker"]}</td>'
+                    f'<td style="padding:5px 7px;text-align:right;font-weight:700;color:#e6edf3;white-space:nowrap;">${float(r["price"]):.2f}</td>'
+                    f'<td style="padding:5px 7px;text-align:right;color:#c9d1d9;white-space:nowrap;">{r["shares_str"]}</td>'
+                    f'<td style="padding:5px 7px;text-align:right;font-weight:800;color:#38bdf8;white-space:nowrap;">{amt_disp}</td>'
+                    f'<td style="padding:5px 6px;text-align:center;color:#94a3b8;white-space:nowrap;">{fp_disp}</td>'
+                    f'<td style="padding:5px 7px;text-align:right;color:#8b949e;white-space:nowrap;">{r["time_str"]}{date_badge}</td>'
+                    '</tr>'
+                )
+
+            st.markdown(
+                '<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;overflow:hidden;margin-bottom:8px;">'
+                '<table style="width:100%;border-collapse:collapse;font-size:12px;font-family:\'Inter\',sans-serif;font-variant-numeric:tabular-nums;">'
+                '<thead><tr style="background:#161b22;border-bottom:1px solid #30363d;color:#8b949e;">'
+                '<th style="padding:6px 7px;text-align:left;">Ticker</th>'
+                '<th style="padding:6px 7px;text-align:right;">Precio Nivel</th>'
+                '<th style="padding:6px 7px;text-align:right;">Acciones</th>'
+                '<th style="padding:6px 7px;text-align:right;">Monto Total</th>'
+                '<th style="padding:6px 6px;text-align:center;">% Float</th>'
+                '<th style="padding:6px 7px;text-align:right;">Hora</th>'
+                '</tr></thead>'
+                f'<tbody>{rows_h}</tbody></table></div>',
+                unsafe_allow_html=True,
+            )
+
+            uniq_syms = []
+            for r in filtered:
+                if r["ticker"] not in uniq_syms:
+                    uniq_syms.append(r["ticker"])
+                if len(uniq_syms) >= 8:
+                    break
+            if uniq_syms:
+                st.caption("🔍 **Analizar en 1 clic:**")
+                btn_cols = st.columns(len(uniq_syms))
+                for i_s, sym_pick in enumerate(uniq_syms):
+                    with btn_cols[i_s]:
+                        if st.button(f"🔍 {sym_pick}", key=f"dw_go_dp_{sym_pick}", use_container_width=True):
+                            st.session_state["main_ticker_input"] = sym_pick
+                            st.session_state.force_refresh = True
+                            st.rerun()
+
+        dw_t1, dw_t2, dw_t3 = st.tabs(["🥇 #golden-sweeps", "🌊 #options-sweeps", "🕶️ #dark-pool"])
+        with dw_t1:
+            _render_discord_sweeps_tab(_dw_golden, "golden", "🥇 #golden-sweeps")
+        with dw_t2:
+            _render_discord_sweeps_tab(_dw_sweeps, "sweeps", "🌊 #options-sweeps")
+        with dw_t3:
+            _render_discord_dp_tab(_dw_dp)
+else:
+    with st.expander("🐋 Ballenas Hoy (Conectar tu Discord · Pendiente de Secrets)", expanded=False):
+        st.info(
+            "Para activar tus alertas en vivo de **#golden-sweeps**, **#options-sweeps** y **#dark-pool**, "
+            "agrega estas 4 líneas en **Streamlit Cloud → Manage app → Settings → Secrets**:"
+        )
+        st.code(
+            'DISCORD_BOT_TOKEN = "TU_BOT_TOKEN_AQUI"\n'
+            'DISCORD_GOLDEN_CHANNEL_ID = "ID_CANAL_GOLDEN_SWEEPS"\n'
+            'DISCORD_SWEEPS_CHANNEL_ID = "ID_CANAL_OPTIONS_SWEEPS"\n'
+            'DISCORD_DARKPOOL_CHANNEL_ID = "ID_CANAL_DARK_POOL"',
+            language="toml",
+        )
 
 # Fila 1: Ticker, Spot Manual y Botón Descargar Data
 col_t, col_s, col_b = st.columns([3, 2, 2])
 with col_t:
-    ticker = st.text_input("Ticker", value="SPY").upper().strip()
+    ticker = st.text_input("Ticker", key="main_ticker_input").upper().strip()
 with col_s:
     spot_manual = st.number_input("Spot Manual", value=0.00, step=0.5, format="%.2f")
 with col_b:

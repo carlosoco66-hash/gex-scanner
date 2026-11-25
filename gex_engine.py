@@ -1196,3 +1196,251 @@ def calculate_tactical_metrics(df_gex, df_raw, spot, live_flow=None):
         tactical["radar_df"] = radar_df
 
     return tactical
+
+
+def _parse_money_suffix(raw_txt):
+    """Convierte textos como '1.56M', '508.08K', '$31.8M' o '254.1K' a float."""
+    import re
+    if raw_txt is None:
+        return 0.0
+    s = str(raw_txt).strip().upper().replace("$", "").replace(",", "")
+    m = re.search(r"(-?\d+(?:\.\d+)?)\s*([KMBT])?", s)
+    if not m:
+        return 0.0
+    val = float(m.group(1))
+    suf = m.group(2) or ""
+    mult = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}.get(suf, 1.0)
+    return val * mult
+
+
+def _discord_fetch_messages(channel_id, bot_token, limit=50, timeout=10):
+    """Descarga los últimos mensajes de un canal de Discord usando Bot Token (solo lectura)."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    cid = str(channel_id or "").strip()
+    tok = str(bot_token or "").strip()
+    if not cid or not tok:
+        return [], None
+
+    url = f"https://discord.com/api/v10/channels/{cid}/messages?limit={min(max(int(limit), 1), 100)}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bot {tok}",
+            "Accept": "application/json",
+            "User-Agent": "DiscordBot (https://github.com/carlosoco66-hash/gex-scanner, 1.0)",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return (data if isinstance(data, list) else []), None
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="ignore")[:180]
+        except Exception:
+            body = ""
+        return [], f"HTTP {e.code}: {body or e.reason}"
+    except Exception as e:
+        return [], str(e)
+
+
+def fetch_discord_whales(bot_token, channel_ids, limit=50):
+    """
+    Lee alertas de Tradytics desde tus canales privados de Discord:
+      - golden (#golden-sweeps)
+      - sweeps (#options-sweeps)
+      - dark_pool (#dark-pool)
+    Agrupa golpes repetidos en el mismo contrato para sweeps y devuelve listas ordenadas.
+    """
+    import re
+    try:
+        from zoneinfo import ZoneInfo
+        tz_pt = ZoneInfo("America/Los_Angeles")
+        tz_et = ZoneInfo("America/New_York")
+    except Exception:
+        tz_pt = datetime.timezone(datetime.timedelta(hours=-8))
+        tz_et = datetime.timezone(datetime.timedelta(hours=-5))
+
+    today_pt = datetime.datetime.now(tz_pt).date()
+    today_et = datetime.datetime.now(tz_et).date()
+
+    out = {"golden": [], "sweeps": [], "dark_pool": [], "errors": {}}
+    if not bot_token or not isinstance(channel_ids, dict):
+        return out
+
+    def _msg_dt_pt_et(ts_iso):
+        try:
+            dt_utc = datetime.datetime.fromisoformat(str(ts_iso).replace("Z", "+00:00"))
+            return dt_utc.astimezone(tz_pt), dt_utc.astimezone(tz_et), dt_utc.timestamp()
+        except Exception:
+            now_pt = datetime.datetime.now(tz_pt)
+            now_et = datetime.datetime.now(tz_et)
+            return now_pt, now_et, now_pt.timestamp()
+
+    def _parse_sweep_channel(messages, default_golden=False):
+        grouped = {}
+        for msg in messages:
+            embeds = msg.get("embeds") or []
+            dt_pt, dt_et, ts_epoch = _msg_dt_pt_et(msg.get("timestamp", ""))
+            for emb in embeds:
+                author_name = str((emb.get("author") or {}).get("name") or "")
+                title_txt = str(emb.get("title") or "")
+                desc_txt = str(emb.get("description") or "")
+                header_all = f"{author_name} {title_txt} {desc_txt}".lower()
+
+                fields = {}
+                for fld in (emb.get("fields") or []):
+                    fname = str(fld.get("name") or "").strip().lower()
+                    fval = str(fld.get("value") or "").strip()
+                    fields[fname] = fval
+
+                sym = str(fields.get("symbol") or fields.get("ticker") or "").strip().upper()
+                sym = re.sub(r"[^A-Z0-9.\-]", "", sym)
+                if not sym:
+                    continue
+
+                strike_raw = fields.get("strike", "")
+                try:
+                    strike_val = float(re.sub(r"[^0-9.]", "", strike_raw))
+                except Exception:
+                    strike_val = 0.0
+
+                exp_raw = str(fields.get("expiration") or fields.get("expiry") or "").strip()
+                exp_disp = exp_raw
+                dte_val = -1
+                for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y"):
+                    try:
+                        exp_dt = datetime.datetime.strptime(exp_raw, fmt).date()
+                        dte_val = max((exp_dt - today_et).days, 0)
+                        exp_disp = f"{exp_dt.month}/{exp_dt.day}/{str(exp_dt.year)[-2:]}"
+                        break
+                    except Exception:
+                        continue
+
+                prem_raw = fields.get("premiums") or fields.get("premium") or "0"
+                prem_usd = _parse_money_suffix(prem_raw)
+
+                if "put" in header_all:
+                    opt_type = "PUT"
+                elif "call" in header_all:
+                    opt_type = "CALL"
+                else:
+                    opt_type = "CALL"
+
+                is_golden = ("golden" in header_all) or (default_golden and prem_usd >= 1_000_000)
+
+                time_raw = str(fields.get("time") or "").strip()
+                trade_date = dt_et.date()
+                time_disp = dt_et.strftime("%H:%M ET")
+                m_dt = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})", time_raw)
+                if m_dt:
+                    try:
+                        trade_date = datetime.datetime.strptime(m_dt.group(1), "%Y-%m-%d").date()
+                    except Exception:
+                        pass
+                    time_disp = f"{m_dt.group(2)} ET"
+
+                is_today = (trade_date == today_et) or (dt_pt.date() == today_pt)
+                g_key = (sym, opt_type, round(strike_val, 3), exp_disp, str(trade_date))
+                if g_key not in grouped:
+                    grouped[g_key] = {
+                        "ticker": sym,
+                        "type": opt_type,
+                        "strike": strike_val,
+                        "exp": exp_disp,
+                        "dte": dte_val,
+                        "prem_usd": prem_usd,
+                        "hits": 1,
+                        "is_golden": is_golden,
+                        "time_str": time_disp,
+                        "date_str": str(trade_date),
+                        "is_today": is_today,
+                        "ts_epoch": ts_epoch,
+                    }
+                else:
+                    rec = grouped[g_key]
+                    rec["prem_usd"] += prem_usd
+                    rec["hits"] += 1
+                    rec["is_golden"] = rec["is_golden"] or is_golden
+                    rec["is_today"] = rec["is_today"] or is_today
+                    if ts_epoch > rec["ts_epoch"]:
+                        rec["ts_epoch"] = ts_epoch
+                        rec["time_str"] = time_disp
+
+        items = list(grouped.values())
+        items.sort(key=lambda x: (x["is_today"], x["prem_usd"], x["ts_epoch"]), reverse=True)
+        return items
+
+    def _parse_darkpool_channel(messages):
+        items = []
+        for msg in messages:
+            embeds = msg.get("embeds") or []
+            dt_pt, dt_et, ts_epoch = _msg_dt_pt_et(msg.get("timestamp", ""))
+            for emb in embeds:
+                author_name = str((emb.get("author") or {}).get("name") or "")
+                title_txt = str(emb.get("title") or "")
+                head = (author_name or title_txt).strip()
+                m_sym = re.match(r"^([A-Z]{1,6}(?:\.[A-Z])?)\b", head.upper())
+                sym = m_sym.group(1) if m_sym else ""
+
+                fields = {}
+                for fld in (emb.get("fields") or []):
+                    fname = str(fld.get("name") or "").strip().lower()
+                    fval = str(fld.get("value") or "").strip()
+                    fields[fname] = fval
+
+                if not sym:
+                    sym = str(fields.get("symbol") or fields.get("ticker") or "").strip().upper()
+                if not sym:
+                    continue
+
+                price_raw = fields.get("price", "0")
+                try:
+                    price_val = float(re.sub(r"[^0-9.]", "", price_raw))
+                except Exception:
+                    price_val = 0.0
+
+                shares_str = str(fields.get("shares") or "0").strip()
+                amount_raw = str(fields.get("amount") or "0").strip()
+                amount_usd = _parse_money_suffix(amount_raw)
+                filled_str = str(fields.get("filled") or "").strip()
+
+                details_txt = str(fields.get("ticker & trade details") or "")
+                m_fp = re.search(r"Float\s*Proportion:\s*([0-9.]+%)", details_txt, flags=re.IGNORECASE)
+                float_pct = m_fp.group(1) if m_fp else ""
+
+                is_today = (dt_pt.date() == today_pt) or (dt_et.date() == today_et)
+                items.append({
+                    "ticker": sym,
+                    "price": price_val,
+                    "shares_str": shares_str,
+                    "amount_usd": amount_usd,
+                    "amount_str": amount_raw,
+                    "filled": filled_str,
+                    "float_pct": float_pct,
+                    "time_str": dt_pt.strftime("%H:%M PT"),
+                    "date_str": str(dt_pt.date()),
+                    "is_today": is_today,
+                    "ts_epoch": ts_epoch,
+                })
+
+        items.sort(key=lambda x: (x["is_today"], x["ts_epoch"], x["amount_usd"]), reverse=True)
+        return items
+
+    for key, is_dp in (("golden", False), ("sweeps", False), ("dark_pool", True)):
+        cid = str(channel_ids.get(key) or "").strip()
+        if not cid:
+            continue
+        msgs, err = _discord_fetch_messages(cid, bot_token, limit=limit)
+        if err:
+            out["errors"][key] = err
+            continue
+        if is_dp:
+            out[key] = _parse_darkpool_channel(msgs)
+        else:
+            out[key] = _parse_sweep_channel(msgs, default_golden=(key == "golden"))
+
+    return out
