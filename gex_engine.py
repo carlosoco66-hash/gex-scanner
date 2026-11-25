@@ -542,7 +542,6 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
                 )
                 
                 # Calcular Delta y Gamma con Black-Scholes
-                import math
                 gammas = []
                 deltas = []
                 for idx, row in df_raw.iterrows():
@@ -671,7 +670,6 @@ def fetch_and_calculate_all(ticker, selected_expirations, spot_manual, api_key, 
     df_raw['put_volume'] = df_raw.apply(lambda r: r['volume'] if r['type'] == 'P' else 0.0, axis=1)
     
     # Calcular prima teórica (Black-Scholes) cuando opt_price no venga en la respuesta
-    import math
     if 'opt_price' not in df_raw.columns:
         df_raw['opt_price'] = 0.0
     if 'implied_volatility' not in df_raw.columns:
