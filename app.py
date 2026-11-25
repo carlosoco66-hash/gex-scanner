@@ -2539,7 +2539,7 @@ if st.session_state.expirations:
                     sc_strike_q = st.text_input(
                         "Buscar strike",
                         value="",
-                        placeholder="🔍 Strike (ej. 20)",
+                        placeholder="🔍 Strikes (ej. 20 · 35,36,37 · 35-38)",
                         key="sc_strike_search",
                         label_visibility="collapsed",
                     ).strip().replace("$", "")
@@ -2568,14 +2568,44 @@ if st.session_state.expirations:
                 else:
                     df_contracts["vol_gex"] = pd.to_numeric(df_contracts["vol_gex"], errors="coerce").fillna(0.0)
 
-                # Filtro opcional por strike específico (ej. "20" muestra todos los contratos del strike $20)
-                sc_strike_val = None
+                # Filtro opcional por uno o varios strikes (ej. "20", "35, 36, 37", "20 25 30" o rango "35-38")
+                sc_strike_active = False
+                sc_strike_label = ""
                 if sc_strike_q:
-                    try:
-                        sc_strike_val = float(sc_strike_q)
-                        df_contracts = df_contracts[(df_contracts["strike"] - sc_strike_val).abs() < 0.01].copy()
-                    except Exception:
-                        sc_strike_val = None
+                    import re as _re_sc
+                    exact_targets = []
+                    range_targets = []
+                    for tok in _re_sc.split(r"[,;\s]+", sc_strike_q):
+                        tok = tok.strip()
+                        if not tok:
+                            continue
+                        if "-" in tok:
+                            parts = [p.strip() for p in tok.split("-") if p.strip()]
+                            if len(parts) == 2:
+                                try:
+                                    lo_v, hi_v = float(parts[0]), float(parts[1])
+                                    if lo_v > hi_v:
+                                        lo_v, hi_v = hi_v, lo_v
+                                    range_targets.append((lo_v, hi_v))
+                                    continue
+                                except Exception:
+                                    pass
+                        try:
+                            exact_targets.append(float(tok))
+                        except Exception:
+                            pass
+
+                    if exact_targets or range_targets:
+                        sc_strike_active = True
+                        mask_s = pd.Series(False, index=df_contracts.index)
+                        for val_t in exact_targets:
+                            mask_s = mask_s | ((df_contracts["strike"] - val_t).abs() < 0.01)
+                        for lo_v, hi_v in range_targets:
+                            mask_s = mask_s | ((df_contracts["strike"] >= lo_v - 0.001) & (df_contracts["strike"] <= hi_v + 0.001))
+                        df_contracts = df_contracts[mask_s].copy()
+
+                        lbl_parts = [f"${v:g}" for v in exact_targets] + [f"${lo:g}–${hi:g}" for lo, hi in range_targets]
+                        sc_strike_label = ", ".join(lbl_parts)
 
                 spot_sc = float(res["Spot Price"])
                 if not df_contracts.empty:
@@ -2687,7 +2717,7 @@ if st.session_state.expirations:
                         strike_str = f"${float(rr['strike']):g}"
                         exp_full = str(rr.get("expiry", "") or "")
                         exp_s = exp_full[:7]
-                        if sc_strike_val is not None and exp_s:
+                        if sc_strike_active and exp_s:
                             dte_str = f"{int(rr['dte'])}d <span style='color:#6e7681;font-size:10.5px;'>({exp_s})</span>"
                         else:
                             dte_str = f"<span title='Vence: {exp_full}'>{int(rr['dte'])}d</span>"
@@ -2792,10 +2822,10 @@ if st.session_state.expirations:
 
                 source_tag = "Cadena completa" if using_full_chain else "Fechas seleccionadas"
                 strike_tag = ""
-                if sc_strike_val is not None:
+                if sc_strike_active:
                     tot_oi_s = int(df_contracts["open_interest"].sum()) if not df_contracts.empty else 0
                     tot_vol_s = int(df_contracts["volume"].sum()) if not df_contracts.empty else 0
-                    strike_tag = f" · <span style='color:#fbbf24;'>Strike ${sc_strike_val:g} (Total OI: {tot_oi_s:,} · Vol: {tot_vol_s:,})</span>"
+                    strike_tag = f" · <span style='color:#fbbf24;'>Strikes {sc_strike_label} (Total OI: {tot_oi_s:,} · Vol: {tot_vol_s:,})</span>"
 
                 tab_sc_all, tab_sc_intra, tab_sc_swing, tab_sc_leaps = st.tabs([
                     "🌐 Todos (Completa)",
